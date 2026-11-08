@@ -1,0 +1,98 @@
+/* Everything is scoped under .sg so nothing leaks into the rest of the app. */
+.sg{--panel:rgba(16,9,34,.78);--panel2:rgba(30,16,58,.8);--line:#2a1f4a;--tx:#e6eef9;--mu:#9a8fb8;--cy:#2fd6e6;--pk:#ff4f93;--am:#f2b24c;--gr:#4fe0a0;
+color-scheme:dark;position:relative;min-height:100vh;background:#07030c;color:var(--tx);font:14px/1.4 Inter,system-ui,sans-serif;isolation:isolate}
+.sg *{box-sizing:border-box}
+.sg button,.sg select,.sg input{font-family:inherit}
+.sg .bg{position:fixed;inset:0;z-index:-1;pointer-events:none}
+.sg .sky{position:absolute;inset:0;background:radial-gradient(60% 40% at 50% 100%,rgba(255,47,143,.55),transparent 70%),linear-gradient(#06020b 0%,#14052a 45%,#3a0c4e 75%,#8a1860 100%)}
+.sg .stars{position:absolute;inset:0 0 20% 0;opacity:.8;background-image:radial-gradient(1px 1px at 20px 30px,#fff,transparent),radial-gradient(1px 1px at 90px 120px,#bcd,transparent),radial-gradient(1.5px 1.5px at 160px 60px,#fff,transparent),radial-gradient(1px 1px at 55px 160px,#dcf,transparent);background-size:210px 190px,170px 150px,260px 210px,130px 200px}
+.sg header{display:flex;align-items:center;gap:28px;padding:14px 28px;border-bottom:1px solid var(--line);background:rgba(10,4,22,.8);backdrop-filter:blur(6px)}
+.sg .logo{font-weight:600;letter-spacing:.28em;font-size:18px;display:flex;align-items:center;gap:10px}
+.sg .logo i{width:12px;height:12px;border-radius:50%;background:var(--cy);box-shadow:0 0 12px var(--cy)}
+.sg .tab{color:var(--cy);border-bottom:2px solid var(--cy);padding:6px 4px;font-size:13px}
+.sg .hr{margin-left:auto;display:flex;gap:18px;align-items:center;color:var(--mu);font-size:13px}
+.sg .asof{color:var(--cy)}
+.sg .dsel{display:flex;gap:8px;align-items:center;font-size:12px}
+.sg select{background:#150a2a;color:var(--tx);border:1px solid var(--line);border-radius:8px;padding:6px 10px;font-size:13px}
+.sg main{max-width:1380px;margin:auto;padding:24px 28px;display:grid;grid-template-columns:1fr 330px;gap:20px}
+@media(max-width:1000px){.sg main{grid-template-columns:1fr}}
+.sg .crumb{font-size:10px;letter-spacing:.14em;color:var(--mu)}
+.sg h1{margin:4px 0 0;font-size:32px;font-weight:600}
+.sg .top{grid-column:1/-1}
+.sg .card{background:var(--panel);border:1px solid var(--line);border-radius:12px}
+.sg .fh{display:flex;align-items:center;gap:14px;padding:14px 18px;border-bottom:1px solid var(--line)}
+.sg .fid{border:1px solid #1f6f7a;color:var(--cy);padding:8px 10px;border-radius:7px;font-size:12px;background:#0c2229}
+.sg .fh small{display:block;color:var(--mu);font-size:12px;margin-top:4px}
+.sg .fsel{font-size:16px;font-weight:700;padding:4px 8px}
+.sg .pill{margin-left:auto;font-size:10px;letter-spacing:.08em;padding:5px 10px;border-radius:5px;background:#3a1428;color:var(--pk)}
+.sg .pill.ok{background:#0f2e26;color:var(--gr)}
+.sg .pill.warn{background:#33260c;color:var(--am)}
+.sg .pill.crit{background:#3a1428;color:var(--pk)}
+.sg .banner{display:flex;justify-content:space-between;padding:10px 18px;background:#2a1020;color:#ff8fba;font-size:12px;border-bottom:1px solid var(--line)}
+.sg .banner.warn{background:#2a2010;color:#f5c97a}
+.sg .scene{padding:10px 14px 18px}
+.sg svg.scene-svg{width:100%;height:auto;display:block}
+.sg .lbl{font:600 11px 'JetBrains Mono',monospace;letter-spacing:.12em;fill:#8fa6c2}
+.sg .val{font:600 15px 'JetBrains Mono',monospace;fill:#e6eef9}
+.sg .chip-r{fill:#150a2a;stroke:#4a3a80;stroke-width:1.5}
+.sg .chip-t{font:600 11px 'JetBrains Mono',monospace;letter-spacing:.1em;fill:#e6eef9}
+.sg .leader{stroke:#4a3a80;stroke-width:1.5;stroke-dasharray:3 4}
+.sg .leak-t{font:600 14px 'JetBrains Mono',monospace;letter-spacing:.1em;fill:#ff4f93}
+.sg .flow{stroke-dasharray:10 12;animation:sg-fl 1s linear infinite}
+.sg .flow.slow{animation-duration:2.2s}
+@keyframes sg-fl{to{stroke-dashoffset:-22}}
+.sg .ring{transform-origin:center;transform-box:fill-box;animation:sg-pg 1.6s ease-out infinite}
+@keyframes sg-pg{0%{transform:scale(.6);opacity:.9}100%{transform:scale(2.4);opacity:0}}
+.sg .hot{cursor:pointer}
+.sg .side{display:flex;flex-direction:column;gap:16px}
+.sg .box{padding:16px}
+.sg .box h3{margin:0 0 10px;font-size:13px;font-weight:700;display:flex;justify-content:space-between}
+.sg .box h3 span{color:var(--mu);font-weight:400;font-size:11px}
+.sg .mu{color:var(--mu);font-size:11px;letter-spacing:.08em}
+.sg .al{padding:10px 12px;border-radius:8px;margin-bottom:8px;border:1px solid var(--line);cursor:pointer;background:var(--panel2)}
+.sg .al.on{border-color:#7a2349;background:#2a1020}
+.sg .al.onw{border-color:#8a6a1f;background:#2a2010}
+.sg .al.sel{box-shadow:0 0 0 2px rgba(255,255,255,.25)}
+.sg .al b{display:block;font-weight:700}
+.sg .al small{color:var(--mu);font-size:11px}
+.sg .tag{float:right;font-size:10px;letter-spacing:.08em}
+.sg .map{height:230px;border-radius:10px;background:radial-gradient(circle at 50% 50%,#12233a,#0a111b);position:relative;overflow:hidden}
+.sg .node{position:absolute;transform:translate(-50%,-50%);text-align:center;font-size:9px;letter-spacing:.08em;color:var(--mu);white-space:nowrap}
+.sg .node.click{cursor:pointer}
+.sg .node.cur{color:#fff}
+.sg .node i{display:block;margin:0 auto 5px;width:14px;height:14px;border-radius:50%;background:var(--c);box-shadow:0 0 0 12px color-mix(in srgb,var(--c) 14%,transparent),0 0 16px var(--c)}
+.sg .node.cur i{outline:2px solid #fff;outline-offset:3px}
+.sg .legend{display:flex;gap:14px;margin-top:10px;font-size:11px;color:var(--mu)}
+.sg .legend i{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px}
+.sg .trk{display:flex;gap:12px;align-items:center;background:#0d2a2f;border-color:#1b5560;color:#bff4f7;padding:16px}
+.sg .trk small{display:block;color:#7fbcc2}
+.sg .ov{position:fixed;inset:0;background:rgba(3,7,12,.72);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;z-index:50;padding:20px;overflow:auto}
+.sg .pop{width:min(600px,100%);background:linear-gradient(180deg,#1a1020,#0e1623 60%);border:1px solid var(--pk);border-radius:16px;padding:26px 28px;box-shadow:0 0 60px rgba(255,79,147,.25);animation:sg-in .2s ease-out}
+@keyframes sg-in{from{transform:translateY(12px) scale(.97);opacity:0}}
+.sg .pop h2{margin:4px 0 2px;font-size:22px}
+.sg .x{float:right;background:none;border:1px solid var(--line);color:var(--mu);border-radius:8px;width:32px;height:32px;cursor:pointer;font-size:16px}
+.sg .row{display:flex;justify-content:space-between;align-items:baseline;gap:12px;padding:12px 0;border-bottom:1px solid var(--line)}
+.sg .row span{color:var(--mu);font-size:12px;letter-spacing:.06em}
+.sg .row b{font:600 22px 'JetBrains Mono',monospace;color:var(--pk);text-align:right}
+.sg .row b.w{color:var(--tx)}
+.sg .plan{margin-top:16px;padding:14px 16px;border-radius:12px;background:rgba(47,214,230,.08);border:1px solid #1f6f7a}
+.sg .plan p{margin:6px 0 0;font-size:15px}
+.sg .costs{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:12px;padding-top:10px;border-top:1px solid #1f6f7a;font-size:13px;color:var(--mu)}
+.sg .costs b{color:var(--tx);font-size:16px;margin-left:4px}
+.sg .costs b.sv{color:var(--gr)}
+.sg .toasts{position:fixed;top:70px;right:20px;z-index:60;display:flex;flex-direction:column;gap:10px;max-width:340px}
+.sg .toast{display:flex;gap:12px;align-items:flex-start;padding:14px 16px;border-radius:12px;background:#1a0d22;border:1px solid var(--pk);box-shadow:0 0 30px rgba(255,79,147,.3);animation:sg-in .25s ease-out}
+.sg .toast.warn{border-color:var(--am);box-shadow:0 0 30px rgba(242,178,76,.25)}
+.sg .toast b{display:block;font-size:14px}
+.sg .toast span{display:block;color:var(--mu);font-size:12px;margin-top:2px}
+.sg .toast button{margin-left:auto;background:none;border:0;color:var(--mu);cursor:pointer;font-size:14px}
+.sg footer{grid-column:1/-1;color:#9a8fb8;font-size:12px;display:flex;justify-content:center;padding:8px 0}
+
+/* watery pipe flow */
+.sg .stream{animation:sg-str 1.1s linear infinite}
+.sg .stream.slow{animation-duration:2.4s}
+@keyframes sg-str{from{transform:translateX(0)}to{transform:translateX(40px)}}
+.sg .stream.slow{animation-duration:2.4s}
+.sg .stream.slower{animation-duration:3.8s}
+.sg .stream.crawl{animation-duration:9s}
+.sg .stream.dim{opacity:.5}
