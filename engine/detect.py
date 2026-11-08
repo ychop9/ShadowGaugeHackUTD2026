@@ -5,8 +5,8 @@ Every reference value comes from the dataset's own files:
 - the flow gap (pump flow - pipeline receive flow) should be zero (conservation of water),
 - pipeline pressure is compared with the network's typical running offset above the disposal
   site's `pressure_psi`, measured from this dataset's telemetry.
-Noise levels and the alarm gate are measured from the dataset too, so nothing is tuned to
-the labelled events.
+Noise levels, the healthy flow reference and the alarm gate are measured from the dataset too,
+so nothing is tuned to the labelled events.
 """
 from __future__ import annotations
 
@@ -43,29 +43,56 @@ class Event:
 # ---------------------------------------------------------------- pump failure
 
 def detect_pump_failures(ds: Dataset, now: int | None = None) -> list[Event]:
-    """A pump failure is a run of status-2 samples. The repair lasts exactly
-    expected_repair_hours from onset, so the event ends then (or is ongoing at `now`)."""
-    repair_s = int(ds.ops["expected_repair_hours"]["pump_failure"] * 3600)
+    """A pump failure is a run of status-2 samples. It ends at the start of the first full
+    window of running samples whose mean flow ratio is back inside the healthy band measured
+    from this dataset (see healthy_reference). If no such recovery is in the data, the event
+    is ongoing. No ops.json value is used here."""
+    cal = healthy_reference(ds, now)
+    gate = cal.r_ref - cal.z * cal.sd_ratio / np.sqrt(cal.window)
     events = []
     for item in iter_facilities(ds):
         fac = item["facility"]
-        status = series(ds, fac["pump"]["id"], "status", now)
-        ts, fault = status.index.to_numpy(), status.to_numpy() == FAULT
-        last = int(ts[-1])
-        for s, e in _runs(fault):
+        pump = fac["pump"]
+        status = series(ds, pump["id"], "status", now)
+        flow = series(ds, pump["id"], "flow_bpd", now).reindex(status.index)
+        ratio = flow / pump["max_flow_bpd"]
+        running = ((status == RUNNING) & (flow > 0)).astype(float)
+        ts = status.index.to_numpy()
+        for s, e in _runs((status == FAULT).to_numpy()):
             onset = int(ts[s])
-            repair_end = onset + repair_s
+            end = _recovery_ts(ratio, running, gate, cal.window, start=e + 1)
+            evidence = [f"Pump reports fault status since {_hhmm(onset)} UTC"]
+            if end is None:
+                evidence.append("No recovery in telemetry yet; repair end unknown")
+            else:
+                evidence.append(f"Pump back in healthy flow range at {_hhmm(end)} UTC")
             events.append(Event(
                 category="pump_failure",
                 system_id=item["system"]["id"],
                 facility_id=fac["id"],
-                asset_id=fac["pump"]["id"],
+                asset_id=pump["id"],
                 onset=onset,
-                end=repair_end if repair_end <= last else None,
+                end=end,
                 confidence=1.0,
-                evidence=[f"Pump reports fault status since {_hhmm(onset)} UTC"],
+                evidence=evidence,
             ))
     return events
+
+
+def _recovery_ts(ratio: pd.Series, running: pd.Series, gate: float, w: int,
+                 start: int) -> int | None:
+    """First timestamp of a full window of running samples, starting at or after position
+    `start`, whose mean flow ratio is at or above `gate`. Returns the window's first sample."""
+    r = ratio.iloc[start:]
+    run = running.iloc[start:]
+    if len(r) < w:
+        return None
+    mean_ok = (r.rolling(w, min_periods=w).mean() >= gate).to_numpy()
+    all_running = (run.rolling(w, min_periods=w).min() == 1).to_numpy()
+    hits = np.flatnonzero(mean_ok & all_running)
+    if len(hits) == 0:
+        return None
+    return int(r.index[hits[0] - w + 1])
 
 
 # ---------------------------------------------------------------- shared calibration
@@ -74,8 +101,9 @@ def detect_pump_failures(ds: Dataset, now: int | None = None) -> list[Event]:
 class Calibration:
     interval_s: int    # telemetry sample interval
     window: int        # running samples averaged per decision (one hour)
-    z: float          # gate in standard deviations of the window mean
+    z: float           # gate in standard deviations of the window mean
     p_offset: float    # healthy pipeline pressure above disposal while running, psi
+    r_ref: float       # healthy running flow ratio (flow / max_flow_bpd), measured
     sd_ratio: float    # per-sample noise of pump flow / max_flow_bpd
     sd_gap: float      # per-sample noise of the flow gap fraction
     sd_p: float        # per-sample noise of pipeline pressure, psi
@@ -103,8 +131,8 @@ def _robust_sd(x: pd.Series) -> float:
 
 
 def calibrate(ds: Dataset, frames: dict[str, pd.DataFrame], now: int | None) -> Calibration:
-    """Network-wide noise and gate. Medians and MADs ignore the minority of samples
-    that are inside problems, so no labels are needed."""
+    """Network-wide noise, healthy reference and gate. Medians and MADs ignore the minority
+    of samples that are inside problems, so no labels are needed."""
     allrun = pd.concat(frames.values())
     interval = sample_interval_s(ds)
     window = max(1, round(3600 / interval))
@@ -115,6 +143,7 @@ def calibrate(ds: Dataset, frames: dict[str, pd.DataFrame], now: int | None) -> 
         window=window,
         z=z,
         p_offset=float(allrun["p_off"].median()),
+        r_ref=float(allrun["ratio"].median()),
         sd_ratio=_robust_sd(allrun["ratio"]),
         sd_gap=_robust_sd(allrun["gap"]),
         sd_p=_robust_sd(allrun["p_off"]),
@@ -191,8 +220,8 @@ def detect_slow_problems(ds: Dataset, now: int | None = None,
         mean = df.rolling(w, min_periods=w).mean()
         last = int(df.index[-1])
 
-        # Degradation: hourly mean flow below the pump's rated flow.
-        z_deg = (1.0 - mean["ratio"]) / (cal.sd_ratio / root_w)
+        # Degradation: hourly mean flow below the measured healthy running flow.
+        z_deg = (cal.r_ref - mean["ratio"]) / (cal.sd_ratio / root_w)
         for onset, end, peak, latest in _episodes(df, z_deg, cal, last):
             cut = [t for t in fail_onsets.get(fac["id"], []) if t > onset and (end is None or t < end)]
             if cut:
