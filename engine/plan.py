@@ -13,6 +13,8 @@ from __future__ import annotations
 import itertools
 from dataclasses import dataclass, field
 
+import numpy as np
+
 from .loader import Dataset, iter_facilities, series
 
 EPS = 1e-9
@@ -243,15 +245,40 @@ def do_nothing(st: TankState, truck_cap: float, trip_cost: float) -> Plan:
     return plan_cost(st, 0, 0, (), 0.0, truck_cap, trip_cost)
 
 
-def plan_ongoing_failures(ds: Dataset, failures: list, now: int) -> dict[str, tuple[TankState, Plan, Plan]]:
+# ---------------------------------------------------------------- repair horizon
+
+def repair_prior_s(ds: Dataset, all_failures: list) -> float:
+    """Typical pump-failure repair duration in seconds, from closed pump failures in this
+    dataset. Falls back to ops.json only when the dataset has no closed pump failures."""
+    closed = [f.end - f.onset for f in all_failures
+              if f.category == "pump_failure" and f.end is not None]
+    if closed:
+        return float(np.median(closed))
+    return float(ds.ops["expected_repair_hours"]["pump_failure"] * 3600)
+
+
+def _repair_end(ev, now: int, prior_s: float) -> int:
+    """Observed recovery if there is one. Otherwise use the prior from onset. If the prior has
+    already passed, the repair is overdue, so plan against a fresh prior from now."""
+    if ev.end is not None:
+        return ev.end
+    planned = ev.onset + prior_s
+    return planned if planned > now else int(now + prior_s)
+
+
+def plan_ongoing_failures(ds: Dataset, failures: list, now: int,
+                          prior_s: float | None = None) -> dict[str, tuple[TankState, Plan, Plan]]:
     """failures: ongoing pump_failure events.
+    prior_s: typical repair duration in seconds, from repair_prior_s(). If omitted, the
+    ops.json value is used so existing callers keep working.
     Returns facility_id -> (state, recommended plan, do-nothing plan)."""
+    if prior_s is None:
+        prior_s = float(ds.ops["expected_repair_hours"]["pump_failure"] * 3600)
     items = {it["facility"]["id"]: it for it in iter_facilities(ds)}
-    repair_s = ds.ops["expected_repair_hours"]["pump_failure"] * 3600
     truck = ds.ops["emergency_trucking"]
     by_system: dict[str, list[TankState]] = {}
     for ev in failures:
-        st = tank_state(ds, items[ev.facility_id], ev.onset + repair_s, now)
+        st = tank_state(ds, items[ev.facility_id], _repair_end(ev, now, prior_s), now)
         by_system.setdefault(st.system_id, []).append(st)
 
     out = {}
@@ -261,4 +288,38 @@ def plan_ongoing_failures(ds: Dataset, failures: list, now: int) -> dict[str, tu
         plans = plan_system(states, fleet, cap, cost)
         for st in states:
             out[st.facility_id] = (st, plans[st.facility_id], do_nothing(st, cap, cost))
+    return out
+
+def projected_levels(st: TankState, trucks: int, trips: int, truck_cap: float,
+                     shut: tuple[Well, ...], t_shut: float,
+                     step_min: float = 5.0) -> list[tuple[float, float]]:
+    """Tank level in percent over time under a plan, in minutes from now.
+
+    Each truck arrival removes truck_cap * trucks barrels. Wells in `shut` stop at t_shut.
+    Once the tank reaches its shutdown limit, inflow stops and stays stopped until the
+    repair ends (shutdown latches). Returns (minute, level_pct) pairs every step_min minutes.
+    """
+    arrivals = [st.response_min + i * st.cycle_min for i in range(trips)] if trucks else []
+    applied = 0
+    q_full = st.inflow_bpm
+    q_after = q_full - sum(w.water_bpm for w in shut)
+    v = st.volume
+    latched = False
+    out = [(0.0, st.level_pct)]
+    t = 0.0
+    while t < st.horizon_min:
+        t_next = min(t + 1.0, st.horizon_min)     # integrate one minute at a time
+        step = t_next - t
+        if not latched:
+            q = q_after if shut and t >= t_shut else q_full
+            v += q * step
+            if v >= st.limit:
+                v = st.limit
+                latched = True
+        while applied < len(arrivals) and arrivals[applied] <= t_next:
+            v = max(0.0, v - truck_cap * trucks)
+            applied += 1
+        t = t_next
+        if abs(t / step_min - round(t / step_min)) < 1e-9:
+            out.append((t, 100 * v / st.capacity_bbl))
     return out
