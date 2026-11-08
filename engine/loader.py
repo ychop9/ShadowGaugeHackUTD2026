@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 REQUIRED_FILES = ("network.json", "ops.json", "telemetry.csv")
@@ -17,6 +18,8 @@ class Dataset:
     network: dict
     ops: dict
     telemetry: pd.DataFrame  # index: (asset_id, metric, ts_unix); column: value
+    # Derived lookups built on first use (per-sensor series, timestamps). Not part of equality.
+    _cache: dict = field(default_factory=dict, init=False, repr=False, compare=False)
 
 
 def load_dataset(folder: str | Path, cache_dir: str | Path = "cache") -> Dataset:
@@ -70,21 +73,46 @@ def _validate(network: dict, ops: dict) -> None:
                 raise ValueError(f"ops.json has no response/cycle for {fac['id']}")
 
 
+def _series_map(ds: Dataset) -> dict[tuple[str, str], pd.Series]:
+    """Splits the long telemetry table into one time-sorted series per (asset, metric), once.
+    Looking a sensor up in the MultiIndex costs ~10 ms per call; this makes it ~free."""
+    m = ds._cache.get("series")
+    if m is None:
+        m = {}
+        for (asset, metric), g in ds.telemetry["value"].groupby(level=[0, 1], sort=False):
+            ts = g.index.get_level_values("ts_unix").to_numpy()
+            m[(str(asset), str(metric))] = pd.Series(g.to_numpy(), index=pd.Index(ts, name="ts_unix"),
+                                                     name="value").sort_index()
+        ds._cache["series"] = m
+    return m
+
+
 def series(ds: Dataset, asset_id: str, metric: str, now: int | None = None) -> pd.Series:
-    """Sensor series indexed by ts_unix, optionally sliced to ts_unix <= now."""
-    s = ds.telemetry.loc[(asset_id, metric), "value"]
+    """Sensor series indexed by ts_unix, optionally sliced to ts_unix <= now.
+    Raises KeyError if the dataset has no such sensor."""
+    s = _series_map(ds)[(asset_id, metric)]
     if now is not None:
-        s = s[s.index <= now]
+        s = s.iloc[: s.index.searchsorted(now, side="right")]
     return s
 
 
+def _times(ds: Dataset) -> np.ndarray:
+    t = ds._cache.get("times")
+    if t is None:
+        t = ds._cache["times"] = np.unique(ds.telemetry.index.get_level_values("ts_unix").to_numpy())
+    return t
+
+
+def first_ts(ds: Dataset) -> int:
+    return int(_times(ds)[0])
+
+
 def last_ts(ds: Dataset) -> int:
-    return int(ds.telemetry.index.get_level_values("ts_unix").max())
+    return int(_times(ds)[-1])
 
 
 def sample_interval_s(ds: Dataset) -> int:
-    ts = pd.Series(ds.telemetry.index.get_level_values("ts_unix").unique()).sort_values()
-    return int(ts.diff().median())
+    return int(np.median(np.diff(_times(ds))))
 
 
 def iter_facilities(ds: Dataset):

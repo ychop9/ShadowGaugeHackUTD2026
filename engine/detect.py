@@ -33,6 +33,7 @@ class Event:
     end: int | None          # ts_unix when resolved, None when ongoing
     confidence: float
     evidence: list[str] = field(default_factory=list)
+    impact: dict = field(default_factory=dict)   # measured size of the problem (slow problems)
 
     @property
     def ongoing(self) -> bool:
@@ -203,6 +204,9 @@ def detect_slow_problems(ds: Dataset, now: int | None = None,
                 onset, end, _confidence(latest if end is None else peak, cal),
                 [f"Pump moving {drop:.1f}% less than its rated {fac['pump']['max_flow_bpd']:,} bpd "
                  f"while running", "Pipeline flow matches pump flow, so the water is not leaking"],
+                {"flow_pct_of_rated": round(100 * ref["ratio"], 1),
+                 "pumping_bpd": round(ref["ratio"] * fac["pump"]["max_flow_bpd"]),
+                 "rated_bpd": fac["pump"]["max_flow_bpd"]},
             ))
 
         # Leak: water goes missing (gap up) AND pipeline pressure drops. Both must agree.
@@ -216,6 +220,10 @@ def detect_slow_problems(ds: Dataset, now: int | None = None,
                 onset, end, _confidence(latest if end is None else peak, cal),
                 [f"{100 * ref['gap']:.1f}% of pumped water is not arriving at disposal",
                  f"Pipeline pressure {cal.p_offset - ref['p_off']:.0f} psi below normal"],
+                {"lost_pct": round(100 * ref["gap"], 1),
+                 # water escaping per day of pumping: missing fraction x pumped flow
+                 "lost_bpd_while_pumping": round(ref["gap"] * ref["ratio"] * fac["pump"]["max_flow_bpd"]),
+                 "pressure_drop_psi": round(cal.p_offset - ref["p_off"], 1)},
             ))
 
     # Slow problems are only visible while water is flowing. Say so when the pump is idle.

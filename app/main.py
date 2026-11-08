@@ -6,6 +6,7 @@ so the judging `test/` folder shows up with no code change.
 """
 from __future__ import annotations
 
+import threading
 from functools import lru_cache
 from pathlib import Path
 
@@ -15,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.auth import USERS_DB, LoginRequest, create_access_token, verify_password
 from engine.dashboard import dashboard
 from engine.events import analyze
-from engine.loader import REQUIRED_FILES, Dataset, last_ts, load_dataset, series
+from engine.loader import REQUIRED_FILES, Dataset, first_ts, last_ts, load_dataset, series
 
 ROOT = Path(__file__).resolve().parent.parent
 SEARCH_DIRS = [ROOT / "data", ROOT / "test"]
@@ -23,6 +24,21 @@ CACHE_DIR = ROOT / "cache"
 
 app = FastAPI(title="ShadowGauge API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+@app.on_event("startup")
+def _warm_up():
+    """Load every dataset and compute its latest dashboard in the background, so switching
+    datasets in the UI is instant. One at a time to keep memory low. A test/ folder added
+    later is still picked up on first request."""
+    def run():
+        for name in discover():
+            try:
+                get_dashboard(name)
+                timeline(name)
+            except Exception as e:   # a broken folder must not stop the others
+                print(f"warm-up skipped {name}: {e}")
+    threading.Thread(target=run, daemon=True).start()
 
 
 # ---------------------------------------------------------------- datasets
@@ -57,8 +73,7 @@ def _analysis(name: str, now: int, mtime_ns: int) -> dict:
 
 
 def _clamp_now(ds: Dataset, now: int | None) -> int:
-    first = int(ds.telemetry.index.get_level_values("ts_unix").min())
-    end = last_ts(ds)
+    first, end = first_ts(ds), last_ts(ds)
     return end if now is None else max(first, min(end, now))
 
 
@@ -94,9 +109,8 @@ def list_datasets():
 def network(name: str):
     """network.json + ops.json + the telemetry time range, for the map and the time slider."""
     ds = get_dataset(name)
-    ts = ds.telemetry.index.get_level_values("ts_unix")
     return {"network": ds.network, "ops": ds.ops,
-            "time_range": {"start_unix": int(ts.min()), "end_unix": int(ts.max())}}
+            "time_range": {"start_unix": first_ts(ds), "end_unix": last_ts(ds)}}
 
 
 @app.get("/api/v1/datasets/{name}/analysis")
@@ -139,3 +153,23 @@ def get_series(name: str, asset_id: str, metric: str,
     s = s.iloc[::step]
     return {"asset_id": asset_id, "metric": metric,
             "points": [[int(t), float(v)] for t, v in s.items()]}
+
+
+@lru_cache(maxsize=16)
+def _timeline(name: str, mtime_ns: int) -> dict:
+    ds = get_dataset(name)
+    res = analyze(ds, last_ts(ds))
+    return {"time_range": {"start_unix": first_ts(ds), "end_unix": last_ts(ds)},
+            "events": [{"event_id": e["event_id"], "category": e["category"],
+                        "facility_id": e["facility_id"], "onset_unix": e["onset_unix"],
+                        "end_unix": e["end_unix"]} for e in res["events"]]}
+
+
+@app.get("/api/v1/datasets/{name}/timeline")
+def timeline(name: str):
+    """Every event found in the whole recording (onset/end), for the replay slider's markers
+    and the jump-to-next-event button. Navigation only: what the page shows at any moment
+    still comes from /dashboard?now=, which uses readings up to that moment and nothing later."""
+    get_dataset(name)
+    folder = discover()[name]
+    return _timeline(name, (folder / "telemetry.csv").stat().st_mtime_ns)

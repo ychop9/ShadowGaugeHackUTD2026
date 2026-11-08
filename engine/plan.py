@@ -73,6 +73,7 @@ class Plan:
     trips_at_min: float | None = None   # when the tank still reaches shutdown under this plan
     cost: float = 0.0
     breakdown: dict = field(default_factory=dict)
+    compared: int = 1                    # candidate plans evaluated to find this one
 
     def actions(self) -> list[dict]:
         out = []
@@ -177,8 +178,10 @@ def plan_cost(st: TankState, trucks: int, trips: int, shut: tuple[Well, ...], t_
                  "automatic_shut_in": round(auto_cost, 2)})
 
 
-def best_plan(st: TankState, max_trucks: int, truck_cap: float, trip_cost: float) -> Plan:
-    """Cheapest plan using at most max_trucks trucks."""
+def best_plan(st: TankState, max_trucks: int, truck_cap: float, trip_cost: float,
+              allow_shut: bool = True, min_trucks: int = 0) -> Plan:
+    """Cheapest plan using at most max_trucks trucks (and at least min_trucks).
+    allow_shut=False restricts the search to trucking only."""
     if st.already_shut or st.horizon_min <= 0:
         return Plan(st.facility_id, cost=st.revenue_ph * st.horizon_min / 60,
                     breakdown={"automatic_shut_in": round(st.revenue_ph * st.horizon_min / 60, 2)})
@@ -187,10 +190,14 @@ def best_plan(st: TankState, max_trucks: int, truck_cap: float, trip_cost: float
     while st.response_min + max_trips * st.cycle_min < st.horizon_min:
         max_trips += 1
 
-    subsets = [()] + [c for r in range(1, len(st.wells) + 1)
-                      for c in itertools.combinations(st.wells, r)]
+    subsets = [()]
+    if allow_shut:
+        subsets += [c for r in range(1, len(st.wells) + 1) for c in itertools.combinations(st.wells, r)]
     best: Plan | None = None
-    for k in range(0, max_trucks + 1):
+    compared = 0
+    if min_trucks > 0 and max_trips == 0:
+        return None   # no truck can arrive before the repair ends
+    for k in range(min_trucks, max_trucks + 1):
         for m in ([0] if k == 0 else range(1, max_trips + 1)):
             for shut in subsets:
                 if not shut:
@@ -200,10 +207,25 @@ def best_plan(st: TankState, max_trucks: int, truck_cap: float, trip_cost: float
                     t = _latest_safe_shut(st, k, m, shut, truck_cap)
                     if t is not None:
                         cands.append(plan_cost(st, k, m, shut, t, truck_cap, trip_cost))
+                compared += len(cands)
                 for p in cands:
                     if best is None or p.cost < best.cost - 1e-6:
                         best = p
+    best.compared = compared
     return best
+
+
+def compare_options(st: TankState, fleet: int, truck_cap: float, trip_cost: float) -> list[dict]:
+    """The pure strategies next to each other, so the operator can see why the plan wins.
+    Each is the cheapest plan of its kind."""
+    def row(label, p):
+        return None if p is None else {"label": label, "summary": p.summary(), "cost": round(p.cost, 2),
+                                       "reaches_shutdown": p.trips_at_min is not None}
+    rows = [row("Do nothing", do_nothing(st, truck_cap, trip_cost)),
+            row("Shut in wells only", best_plan(st, 0, truck_cap, trip_cost))]
+    if fleet:
+        rows.append(row("Trucks only", best_plan(st, fleet, truck_cap, trip_cost, allow_shut=False, min_trucks=1)))
+    return [r for r in rows if r]
 
 
 def _latest_safe_shut(st, k, m, shut, cap) -> float | None:
@@ -243,9 +265,9 @@ def do_nothing(st: TankState, truck_cap: float, trip_cost: float) -> Plan:
     return plan_cost(st, 0, 0, (), 0.0, truck_cap, trip_cost)
 
 
-def plan_ongoing_failures(ds: Dataset, failures: list, now: int) -> dict[str, tuple[TankState, Plan, Plan]]:
+def plan_ongoing_failures(ds: Dataset, failures: list, now: int) -> dict[str, tuple]:
     """failures: ongoing pump_failure events.
-    Returns facility_id -> (state, recommended plan, do-nothing plan)."""
+    Returns facility_id -> (state, recommended plan, do-nothing plan, decision info)."""
     items = {it["facility"]["id"]: it for it in iter_facilities(ds)}
     repair_s = ds.ops["expected_repair_hours"]["pump_failure"] * 3600
     truck = ds.ops["emergency_trucking"]
@@ -259,6 +281,15 @@ def plan_ongoing_failures(ds: Dataset, failures: list, now: int) -> dict[str, tu
         fleet = ds.ops["systems"][sid]["emergency_fleet_size"]
         cap, cost = truck["truck_capacity_bbl"], truck["cost_per_trip"]
         plans = plan_system(states, fleet, cap, cost)
+        splits = sum(1 for a in itertools.product(range(fleet + 1), repeat=len(states)) if sum(a) <= fleet)
         for st in states:
-            out[st.facility_id] = (st, plans[st.facility_id], do_nothing(st, cap, cost))
+            p = plans[st.facility_id]
+            info = {
+                "options": compare_options(st, fleet, cap, cost),
+                "plans_compared": p.compared,
+                "fleet_size": fleet,
+                "sharing_with": [s.facility_id for s in states if s is not st],
+                "fleet_splits_compared": splits if len(states) > 1 else None,
+            }
+            out[st.facility_id] = (st, p, do_nothing(st, cap, cost), info)
     return out

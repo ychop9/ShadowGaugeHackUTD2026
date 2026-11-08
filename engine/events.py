@@ -33,10 +33,18 @@ def analyze(ds: Dataset, now: int | None = None) -> dict:
 
     alerts = [e for e in events if e["status"] == "ongoing"]
     alerts.sort(key=lambda e: (
-        e["category"] != "pump_failure",                              # failures first
+        e["category"] != "pump_failure",                              # failures first (SPEC)
         e["hours_to_limit"]["p50"] if e["hours_to_limit"] else float("inf"),
         -(e.get("lost_revenue_per_hour") or 0),                        # tie: costlier first
+        e["category"] != "pipeline_leak",                              # then leaks (water lost)
+        -(e.get("impact", {}).get("lost_bpd_while_pumping") or 0),    # bigger leak first
+        e.get("impact", {}).get("flow_pct_of_rated") or 100,           # most worn pump first
     ))
+    for i, e in enumerate(alerts, start=1):
+        e["severity"] = ("critical" if e["category"] == "pump_failure" and e["hours_to_limit"]
+                         and e["hours_to_limit"]["p50"] < 2 else
+                         "high" if e["category"] in ("pump_failure", "pipeline_leak") else "watch")
+        e["rank"] = i
     return {"dataset": ds.name, "now_unix": now, "now_ts": _iso(now),
             "alerts": alerts, "events": events}
 
@@ -60,13 +68,15 @@ def _to_dict(ev: Event, n: int, planned) -> dict:
         "recommended_actions": [],
     }
     if ev.category != "pump_failure":
+        d["impact"] = dict(ev.impact)
         if ev.ongoing:
+            # SPEC: leaks and worn pumps get field_inspection and no countdown.
             d["recommended_actions"] = [{"type": "field_inspection", "asset_id": ev.asset_id}]
         return d
     if planned is None:
         return d
 
-    st, plan, nothing = planned
+    st, plan, nothing, info = planned
     htl = st.hours_to_limit()
     arrivals = [st.response_min + i * st.cycle_min for i in range(plan.trips_per_truck)]
     d.update({
@@ -85,6 +95,12 @@ def _to_dict(ev: Event, n: int, planned) -> dict:
             "shutdown_after_min": None if nothing.trips_at_min is None else round(nothing.trips_at_min),
         },
         "savings": round(nothing.cost - plan.cost, 2),
+        # How the plan was chosen, for the "why this plan" panel.
+        "decision": {**info, "inflow_bpd": round(st.inflow_bpm * 1440),
+                     "shutdown_pct": st.shutdown_pct, "capacity_bbl": st.capacity_bbl,
+                     "response_min": st.response_min, "cycle_min": st.cycle_min,
+                     "wells": [{"id": w.id, "water_bpd": round(w.water_bpm * 1440),
+                                "revenue_per_hour": round(w.revenue_ph, 2)} for w in st.wells]},
     })
     if st.already_shut:
         d["evidence"].append("Tank already at shutdown; wells are shut in until the repair ends")

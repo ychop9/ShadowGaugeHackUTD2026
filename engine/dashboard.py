@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from .detect import healthy_reference
 from .events import analyze
-from .loader import Dataset, iter_facilities, series
+from .loader import Dataset, first_ts, iter_facilities, last_ts, series
 
 # Telemetry pump status codes (docs/SPEC.md): 0 stopped, 1 running, 2 fault.
 PUMP_STATE = {0: "stopped", 1: "running", 2: "fault"}
@@ -40,6 +40,13 @@ def dashboard(ds: Dataset, now: int | None = None) -> dict:
         status = _latest(ds, pump["id"], "status", now)
         issues = ongoing.get(fac["id"], [])
         cats = {e["category"] for e in issues}
+        inflow = _latest(ds, fac["id"], "inflow_bpd", now)
+        for e in issues:
+            imp = e.get("impact")
+            if e["category"] == "pump_degradation" and imp and inflow is not None:
+                # A worn pump is only urgent if it can no longer move what the wells produce.
+                imp["inflow_bpd"] = round(inflow)
+                imp["keeps_up"] = imp["pumping_bpd"] >= inflow
 
         facilities.append({
             "id": fac["id"],
@@ -54,7 +61,7 @@ def dashboard(ds: Dataset, now: int | None = None) -> dict:
                 "oil_bpd": w["oil_bpd"],
                 "gas_mcfd": w["gas_mcfd"],
             } for w in fac["wells"]],
-            "inflow_bpd": _latest(ds, fac["id"], "inflow_bpd", now),
+            "inflow_bpd": inflow,
             "tank": {
                 "id": tank["id"],
                 "capacity_bbl": tank["capacity_bbl"],
@@ -111,12 +118,11 @@ def dashboard(ds: Dataset, now: int | None = None) -> dict:
             "trucks_free": fleet - used,
         })
 
-    tel_ts = ds.telemetry.index.get_level_values("ts_unix")
     return {
         "dataset": ds.name,
         "now_ts": result["now_ts"],
         "now_unix": now,
-        "time_range": {"start_unix": int(tel_ts.min()), "end_unix": int(tel_ts.max())},
+        "time_range": {"start_unix": first_ts(ds), "end_unix": last_ts(ds)},
         "units": ds.network.get("meta", {}).get("units"),
         "prices": ds.ops["prices"],
         "emergency_trucking": ds.ops["emergency_trucking"],
