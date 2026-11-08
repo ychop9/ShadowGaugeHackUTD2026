@@ -156,9 +156,9 @@ color-scheme:dark;position:relative;min-height:100vh;background:#0c0518;color:va
 .sg .chk .t{font-size:13px}
 .sg .chk .when{grid-column:2;color:var(--cy);font-size:11px;letter-spacing:.06em}
 .sg .chk li.done .t{text-decoration:line-through;color:var(--mu)}
-.sg .crit{position:absolute;top:11%;left:50%;transform:translateX(-50%);z-index:2;display:flex;flex-direction:column;gap:6px;align-items:center}
-.sg .crit button{background:rgba(58,18,20,.92);color:#fff;border:1px solid var(--rd);border-radius:6px;padding:6px 12px;font:700 12px var(--font-geist-mono),monospace;letter-spacing:.08em;cursor:pointer;box-shadow:0 0 18px rgba(255,77,77,.45);animation:sg-blink .9s ease-in-out infinite alternate}
-.sg .crit button:hover{animation:none;background:#4a1418}
+.sg .critban{position:absolute;top:11%;left:50%;transform:translateX(-50%);z-index:2;display:flex;flex-direction:column;gap:6px;align-items:center}
+.sg .critban button{background:rgba(58,18,20,.92);color:#fff;border:1px solid var(--rd);border-radius:6px;padding:6px 12px;font:700 12px var(--font-geist-mono),monospace;letter-spacing:.08em;cursor:pointer;box-shadow:0 0 18px rgba(255,77,77,.45);animation:sg-blink .9s ease-in-out infinite alternate}
+.sg .critban button:hover{animation:none;background:#4a1418}
 .sg .links{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
 .sg .links line{stroke-width:1.2;opacity:.45;vector-effect:non-scaling-stroke}
 .sg .node .nl{display:none}

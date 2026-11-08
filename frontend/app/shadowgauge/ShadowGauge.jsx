@@ -668,7 +668,7 @@ export default function ShadowGauge() {
           <div className="scene">
             {/* critical alerts only: a short banner over the drawing; click opens the full alert */}
             {crit.length > 0 && (
-              <div className="crit">
+              <div className="critban">
                 {crit.map(i => { const m = minBetween(i.shutdownAt, asOf); return (
                   <button key={i.key} type="button" onClick={() => openIssue(i)}>
                     CRITICAL · {short(i.facId)} {m <= 0 ? "is at shutdown" : `shuts down in ${dur(m)}`}
