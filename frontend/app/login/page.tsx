@@ -1,15 +1,52 @@
 "use client";
 
 import { useState } from "react";
+import { useRouter } from "next/navigation";
 
 export default function LoginPage() {
+  const router = useRouter();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
 
-  function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
+  async function handleSubmit(e: React.FormEvent<HTMLFormElement>) {
     e.preventDefault();
-    // TODO: connect to backend login once it's ready
+    setLoading(true);
+    setError("");
+
+    try {
+      // Send POST request to backend authentication endpoint
+      const response = await fetch("http://localhost:8000/api/v1/auth/login", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          username: username,
+          password: password,
+        }),
+      });
+
+      const data = await response.json();
+
+      // Check if response was successful
+      if (!response.ok) {
+        throw new Error(data.detail || "Invalid operator credentials");
+      }
+
+      // Save authentication token and user data to localStorage
+      localStorage.setItem("token", data.access_token);
+      localStorage.setItem("user", JSON.stringify(data.user));
+
+      // Redirect operator to the main dashboard
+      router.push("/");
+    } catch (err: any) {
+      setError(err.message || "Failed to connect to authentication server");
+    } finally {
+      setLoading(false);
+    }
   }
 
   return (
@@ -28,15 +65,21 @@ export default function LoginPage() {
         onSubmit={handleSubmit}
         className="relative z-10 w-full max-w-md rounded-xl border border-fuchsia-500/50 bg-[#1a0b2e]/85 px-8 py-8 shadow-[0_0_30px_rgba(217,70,239,0.45)] backdrop-blur-sm"
       >
-
         <h1 className="mt-3 text-center text-4xl font-bold tracking-wider text-white [text-shadow:0_0_12px_rgba(232,121,249,0.9)]">
           SIGN IN
         </h1>
 
+        {/* Error Notification Alert */}
+        {error && (
+          <div className="mt-4 rounded border border-red-500/50 bg-red-950/60 p-3 text-center text-xs font-bold tracking-wider text-red-300 shadow-[0_0_10px_rgba(239,68,68,0.3)]">
+            ⚠️ {error}
+          </div>
+        )}
+
         {/* Username */}
         <label
           htmlFor="username"
-          className="mt-8 block text-xs font-semibold tracking-wider text-violet-200/80"
+          className="mt-6 block text-xs font-semibold tracking-wider text-violet-200/80"
         >
           OPERATOR USERNAME
         </label>
@@ -45,9 +88,10 @@ export default function LoginPage() {
             id="username"
             type="text"
             autoComplete="username"
+            required
             value={username}
             onChange={(e) => setUsername(e.target.value)}
-            placeholder="e.g. OP-7492-VIGIL"
+            placeholder="e.g. admin"
             className="w-full rounded-md border border-violet-700/60 bg-[#0d0418] px-3 py-3 pr-10 text-sm tracking-wider text-violet-100 placeholder:text-violet-400/40 outline-none transition focus:border-fuchsia-500 focus:shadow-[0_0_10px_rgba(217,70,239,0.5)]"
           />
           {/* ID badge icon */}
@@ -78,6 +122,7 @@ export default function LoginPage() {
             id="password"
             type={showPassword ? "text" : "password"}
             autoComplete="current-password"
+            required
             value={password}
             onChange={(e) => setPassword(e.target.value)}
             placeholder="••••••••••••"
@@ -106,9 +151,10 @@ export default function LoginPage() {
         {/* Submit */}
         <button
           type="submit"
-          className="mt-8 flex w-full items-center justify-center gap-2 rounded-md bg-fuchsia-500 py-3 text-sm font-bold tracking-[0.2em] text-[#1a0b2e] shadow-[0_0_20px_rgba(217,70,239,0.7)] transition hover:bg-fuchsia-400 active:scale-[0.99]"
+          disabled={loading}
+          className="mt-8 flex w-full items-center justify-center gap-2 rounded-md bg-fuchsia-500 py-3 text-sm font-bold tracking-[0.2em] text-[#1a0b2e] shadow-[0_0_20px_rgba(217,70,239,0.7)] transition hover:bg-fuchsia-400 active:scale-[0.99] disabled:opacity-50"
         >
-          SIGN IN
+          {loading ? "AUTHENTICATING..." : "SIGN IN"}
           <svg
             aria-hidden
             viewBox="0 0 24 24"
