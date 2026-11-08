@@ -1,0 +1,7 @@
+numpy
+pandas
+pyarrow
+fastapi
+uvicorn
+python-jose
+pydantic

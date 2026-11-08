@@ -1,185 +1,252 @@
+"""Detect pump failures, pump degradation and pipeline leaks from sensor readings alone.
+
+Every reference value comes from the dataset's own files:
+- pump flow is compared with the pump's `max_flow_bpd` (network.json),
+- the flow gap (pump flow - pipeline receive flow) should be zero (conservation of water),
+- pipeline pressure is compared with the network's typical running offset above the disposal
+  site's `pressure_psi`, measured from this dataset's telemetry.
+Noise levels and the alarm gate are measured from the dataset too, so nothing is tuned to
+the labelled events.
+"""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from statistics import NormalDist
 
 import numpy as np
+import pandas as pd
 
-from .calibrate import (
-    decorrelation_steps,
-    gate_z,
-    robust_scale,
-    rolling_mean,
-    sample_interval_s,
-    steps,
-)
-from .loader import Dataset, iter_facilities, series
+from .loader import Dataset, iter_facilities, sample_interval_s, series
+
+_N = NormalDist()
+MAD_TO_SIGMA = 1 / _N.inv_cdf(0.75)  # converts a median absolute deviation to a std dev
+FAULT, RUNNING = 2, 1                # pump status codes from the spec
+
+
+@dataclass
+class Event:
+    category: str            # pump_failure | pump_degradation | pipeline_leak
+    system_id: str
+    facility_id: str
+    asset_id: str
+    onset: int               # ts_unix
+    end: int | None          # ts_unix when resolved, None when ongoing
+    confidence: float
+    evidence: list[str] = field(default_factory=list)
+
+    @property
+    def ongoing(self) -> bool:
+        return self.end is None
 
 
 # ---------------------------------------------------------------- pump failure
 
-@dataclass(frozen=True)
-class PumpFailure:
-    facility_id: str
-    pump_id: str
-    onset: int          # ts_unix of first status-2 sample
-    last_fault: int     # ts_unix of last status-2 sample in the run
-    repair_end: int     # onset + expected_repair_hours.pump_failure
-    ongoing: bool       # run still open at `now`
-
-
-def detect_pump_failures(ds: Dataset, now: int | None = None) -> list[PumpFailure]:
-    repair_s = ds.ops["expected_repair_hours"]["pump_failure"] * 3600
-    events: list[PumpFailure] = []
-
+def detect_pump_failures(ds: Dataset, now: int | None = None) -> list[Event]:
+    """A pump failure is a run of status-2 samples. The repair lasts exactly
+    expected_repair_hours from onset, so the event ends then (or is ongoing at `now`)."""
+    repair_s = int(ds.ops["expected_repair_hours"]["pump_failure"] * 3600)
+    events = []
     for item in iter_facilities(ds):
         fac = item["facility"]
-        pump_id = fac["pump"]["id"]
-        status = series(ds, pump_id, "status", now)
-        if status.empty:
-            continue
-
-        ts = status.index.to_numpy()
-        fault = status.to_numpy() == 2
-        if not fault.any():
-            continue
-
-        padded = np.concatenate(([False], fault, [False]))
-        diff = np.diff(padded.astype(np.int8))
-        starts = np.flatnonzero(diff == 1)
-        ends = np.flatnonzero(diff == -1) - 1
-
-        for s, e in zip(starts, ends):
+        status = series(ds, fac["pump"]["id"], "status", now)
+        ts, fault = status.index.to_numpy(), status.to_numpy() == FAULT
+        last = int(ts[-1])
+        for s, e in _runs(fault):
             onset = int(ts[s])
-            events.append(PumpFailure(
+            repair_end = onset + repair_s
+            events.append(Event(
+                category="pump_failure",
+                system_id=item["system"]["id"],
                 facility_id=fac["id"],
-                pump_id=pump_id,
+                asset_id=fac["pump"]["id"],
                 onset=onset,
-                last_fault=int(ts[e]),
-                repair_end=onset + repair_s,
-                ongoing=bool(e == len(fault) - 1),
+                end=repair_end if repair_end <= last else None,
+                confidence=1.0,
+                evidence=[f"Pump reports fault status since {_hhmm(onset)} UTC"],
             ))
-
     return events
 
 
-# ---------------------------------------------------------------- pump degradation
+# ---------------------------------------------------------------- shared calibration
 
 @dataclass(frozen=True)
-class PumpDegradation:
-    facility_id: str
-    pump_id: str
-    onset: int          # back-dated hinge onset (when the decline started)
-    detected: int       # first sample the rolling mean was confirmed low
-    ongoing: bool
-    drop_pct: float     # percent below the healthy ratio at detection
-    confidence: float   # normal CDF of the detection's deviation, in sigma
+class Calibration:
+    interval_s: int    # telemetry sample interval
+    window: int        # running samples averaged per decision (one hour)
+    z: float          # gate in standard deviations of the window mean
+    p_offset: float    # healthy pipeline pressure above disposal while running, psi
+    sd_ratio: float    # per-sample noise of pump flow / max_flow_bpd
+    sd_gap: float      # per-sample noise of the flow gap fraction
+    sd_p: float        # per-sample noise of pipeline pressure, psi
 
 
-def _run_segment_ids(s: np.ndarray) -> np.ndarray:
-    """Segment id for each running sample; -1 when the pump is not running.
-    A new segment starts at each non-running -> running transition."""
-    running = s == 1
-    starts = running & ~np.concatenate(([False], running[:-1]))
-    return np.where(running, np.cumsum(starts), -1)
+def _running_frame(ds: Dataset, item: dict, now: int | None) -> pd.DataFrame:
+    """Signals for one facility, restricted to samples where the pump is running."""
+    fac = item["facility"]
+    pump, pipe = fac["pump"], fac["pipeline"]
+    disposal = item["system"]["disposal_site"]["pressure_psi"]
+    status = series(ds, pump["id"], "status", now)
+    flow = series(ds, pump["id"], "flow_bpd", now)
+    recv = series(ds, pipe["id"], "receive_flow_bpd", now)
+    pres = series(ds, pipe["id"], "pressure_psi", now)
+    df = pd.DataFrame({
+        "ratio": flow / pump["max_flow_bpd"],
+        "gap": (flow - recv) / flow.where(flow > 0),
+        "p_off": pres - disposal,
+    })
+    return df[(status == RUNNING) & (flow > 0)]
 
 
-def _ramp_mask(ratio: np.ndarray, seg: np.ndarray, level: float) -> np.ndarray:
-    """Within each run, mark samples before the ratio first reaches `level`."""
-    mask = np.zeros(len(ratio), dtype=bool)
-    for sid in np.unique(seg[seg >= 0]):
-        idx = np.flatnonzero(seg == sid)
-        ok = np.flatnonzero(ratio[idx] >= level)
-        mask[idx[: (ok[0] if ok.size else len(idx))]] = True
-    return mask
+def _robust_sd(x: pd.Series) -> float:
+    return float(MAD_TO_SIGMA * (x - x.median()).abs().median())
 
 
-def _hinge_onset(ts: np.ndarray, ratio: np.ndarray, seg: np.ndarray, det: int) -> int:
-    """Index of the start of a flat-then-linear decline that best fits the ratio,
-    using only samples in the same running segment up to the detection."""
-    m = np.isfinite(ratio) & (seg == seg[det])
-    m[det + 1:] = False
-    idx = np.flatnonzero(m)
-    if idx.size < 2:
-        return det
+def calibrate(ds: Dataset, frames: dict[str, pd.DataFrame], now: int | None) -> Calibration:
+    """Network-wide noise and gate. Medians and MADs ignore the minority of samples
+    that are inside problems, so no labels are needed."""
+    allrun = pd.concat(frames.values())
+    interval = sample_interval_s(ds)
+    window = max(1, round(3600 / interval))
+    n_windows = max(2.0, len(allrun) / window)
+    z = _N.inv_cdf(1 - 1 / n_windows)  # about one false window expected network-wide
+    return Calibration(
+        interval_s=interval,
+        window=window,
+        z=z,
+        p_offset=float(allrun["p_off"].median()),
+        sd_ratio=_robust_sd(allrun["ratio"]),
+        sd_gap=_robust_sd(allrun["gap"]),
+        sd_p=_robust_sd(allrun["p_off"]),
+    )
 
-    t = ts[idx].astype(float)
-    y = ratio[idx]
-    # Candidate onset c = each sample; dt[c, k] = time from candidate c to sample k, clipped at 0.
-    dt = np.clip(t[None, :] - t[:, None], 0, None)
-    num = ((1 - y)[None, :] * dt).sum(axis=1)
-    den = (dt ** 2).sum(axis=1)
-    slope = np.where(den > 0, np.clip(num / np.where(den > 0, den, 1), 0, None), 0)
-    sse = ((y[None, :] - (1 - slope[:, None] * dt)) ** 2).sum(axis=1)
-    return int(idx[int(np.argmin(sse))])
 
+# ---------------------------------------------------------------- slow problems
 
-def detect_pump_degradation(ds: Dataset, now: int | None = None) -> list[PumpDegradation]:
-    events: list[PumpDegradation] = []
+def _episodes(df: pd.DataFrame, score: pd.Series, cal: Calibration, last_ts: int):
+    """score = z of the hourly mean (positive = abnormal). Confirmed when above the gate
+    for a full window; ends after a full window back below it.
+    Yields (onset_ts, end_ts or None, peak_z, latest_z)."""
+    w = cal.window
+    c = max(1, w // 4)                          # samples back below the gate to call it over
+    above = (score > cal.z).to_numpy()
+    if len(above) < w:
+        return
+    ts = df.index.to_numpy()
+    sc = score.to_numpy()
+    confirm = np.convolve(above, np.ones(w, int), "full")[: len(above)] >= w
+    clear = np.convolve(~above, np.ones(c, int), "full")[: len(above)] >= c
 
-    for item in iter_facilities(ds):
-        fac = item["facility"]
-        pump = fac["pump"]
-        pid, pipe_id = pump["id"], fac["pipeline"]["id"]
+    def back(idx: int, floor: int, n: int) -> int:
+        """Step back n samples from idx, staying >= floor and within n samples of clock time
+        (the pump may have been off in between)."""
+        out = max(floor, idx - n)
+        while out < idx and ts[out] < ts[idx] - n * cal.interval_s:
+            out += 1
+        return out
 
-        st = series(ds, pid, "status", now)
-        if st.empty:
+    i = 0
+    while i < len(above):
+        if not confirm[i]:
+            i += 1
             continue
-        ts, s, n = st.index.to_numpy(), st.to_numpy(), len(st)
-        flow = series(ds, pid, "flow_bpd", now).reindex(ts).to_numpy()
-        recv = series(ds, pipe_id, "receive_flow_bpd", now).reindex(ts).to_numpy()
+        start = i - w + 1                       # first sample of the confirming run
+        onset_idx = back(start, 0, w - 1)       # the first abnormal window began here
+        j = i
+        while j < len(above) and not clear[j]:
+            j += 1
+        if j < len(above):
+            first_clear = j - c + 1
+            end_ts = int(ts[back(first_clear, start, w // 2)])  # mean lags the repair by ~w/2
+            seg = sc[start:first_clear]
+        else:
+            end_ts = None
+            seg = sc[start:]
+        yield int(ts[onset_idx]), end_ts, float(np.nanmax(seg)), float(sc[-1])
+        i = j + 1
 
-        running = np.zeros(n, dtype=bool)
-        running[1:] = (s[1:] == 1) & (s[:-1] == 1)
-        interval = sample_interval_s(ts)
-        repair_steps = steps(ds.ops["expected_repair_hours"]["pump_failure"] * 3600, interval)
 
-        ratio = np.where(running, flow / pump["max_flow_bpd"], np.nan)
-        gap = np.where(running, flow - recv, np.nan)
+def _confidence(z_obs: float, cal: Calibration) -> float:
+    """Probability that the true shift is beyond the gate, given the observed z."""
+    return round(_N.cdf(z_obs - cal.z), 3)
 
-        # Drop leak-like samples, using this dataset's own gap distribution.
-        w = decorrelation_steps(ratio[running], repair_steps)
-        zg = gate_z(np.isfinite(ratio).sum() / w)
-        gs = robust_scale(gap)
-        normal = np.isfinite(gap) & (gap <= gs.center + zg * gs.sigma)
-        ratio = np.where(normal, ratio, np.nan)
 
-        seg = _run_segment_ids(s)
-        rs = rolling_mean(ratio, w)          # NaN unless w consecutive normal running samples
-        if not np.isfinite(rs).any():
-            # Not enough contiguous healthy running data to calibrate this pump yet.
-            # Report nothing rather than guess a baseline.
+def detect_slow_problems(ds: Dataset, now: int | None = None,
+                         failures: list[Event] = ()) -> list[Event]:
+    """failures: pump failures already found. A degrading pump that fails is two events,
+    so its degradation ends when the failure starts."""
+    fail_onsets: dict[str, list[int]] = {}
+    for f in failures:
+        fail_onsets.setdefault(f.facility_id, []).append(f.onset)
+    items = list(iter_facilities(ds))
+    frames = {it["facility"]["id"]: _running_frame(ds, it, now) for it in items}
+    cal = calibrate(ds, frames, now)
+    w, root_w = cal.window, np.sqrt(cal.window)
+    events = []
+    for it in items:
+        fac = it["facility"]
+        df = frames[fac["id"]]
+        if len(df) < w:
             continue
-        base = robust_scale(rs)
-        z = gate_z(np.isfinite(rs).sum() / w)
-        level = base.center - z * base.sigma
+        mean = df.rolling(w, min_periods=w).mean()
+        last = int(df.index[-1])
 
-        # Second pass: drop each run's ramp-up, then recompute the rolling mean.
-        ratio = np.where(_ramp_mask(ratio, seg, level), np.nan, ratio)
-        rs = rolling_mean(ratio, w)
-        below = np.where(np.isfinite(rs), rs < level, False)
-
-        # Confirmed: w consecutive samples below the level.
-        confirmed = np.flatnonzero(np.convolve(below.astype(int), np.ones(w, int))[:n] == w)
-
-        i_next = 0
-        for det in confirmed:
-            if det < i_next:
-                continue
-            j = det + 1
-            while j < n and not ((np.isfinite(rs[j]) and rs[j] > base.center) or s[j] == 2):
-                j += 1
-            onset_idx = _hinge_onset(ts, ratio, seg, det)
-            z_drop = (base.center - rs[det]) / base.sigma
-            events.append(PumpDegradation(
-                facility_id=fac["id"],
-                pump_id=pid,
-                onset=int(ts[onset_idx]),
-                detected=int(ts[det]),
-                ongoing=j >= n,
-                drop_pct=float((1 - rs[det] / base.center) * 100),
-                confidence=float(NormalDist().cdf(z_drop)),
+        # Degradation: hourly mean flow below the pump's rated flow.
+        z_deg = (1.0 - mean["ratio"]) / (cal.sd_ratio / root_w)
+        for onset, end, peak, latest in _episodes(df, z_deg, cal, last):
+            cut = [t for t in fail_onsets.get(fac["id"], []) if t > onset and (end is None or t < end)]
+            if cut:
+                end = min(cut)
+            ref = mean.loc[:end].iloc[-1] if end else mean.iloc[-1]
+            drop = 100 * (1 - ref["ratio"])
+            events.append(Event(
+                "pump_degradation", it["system"]["id"], fac["id"], fac["pump"]["id"],
+                onset, end, _confidence(latest if end is None else peak, cal),
+                [f"Pump moving {drop:.1f}% less than its rated {fac['pump']['max_flow_bpd']:,} bpd "
+                 f"while running", "Pipeline flow matches pump flow, so the water is not leaking"],
             ))
-            i_next = j
 
+        # Leak: water goes missing (gap up) AND pipeline pressure drops. Both must agree.
+        z_gap = mean["gap"] / (cal.sd_gap / root_w)
+        z_p = (cal.p_offset - mean["p_off"]) / (cal.sd_p / root_w)
+        z_leak = np.minimum(z_gap, z_p)
+        for onset, end, peak, latest in _episodes(df, z_leak, cal, last):
+            ref = mean.loc[:end].iloc[-1] if end else mean.iloc[-1]
+            events.append(Event(
+                "pipeline_leak", it["system"]["id"], fac["id"], fac["pipeline"]["id"],
+                onset, end, _confidence(latest if end is None else peak, cal),
+                [f"{100 * ref['gap']:.1f}% of pumped water is not arriving at disposal",
+                 f"Pipeline pressure {cal.p_offset - ref['p_off']:.0f} psi below normal"],
+            ))
+
+    # Slow problems are only visible while water is flowing. Say so when the pump is idle.
+    pump_of = {it["facility"]["id"]: it["facility"]["pump"]["id"] for it in items}
+    for ev in events:
+        df = frames[ev.facility_id]
+        status = series(ds, pump_of[ev.facility_id], "status", now)
+        if ev.ongoing and int(df.index[-1]) < int(status.index[-1]):
+            ev.evidence.append(f"Pump not running since {_hhmm(int(df.index[-1]))} UTC; "
+                               "can't confirm whether this is still happening until it restarts")
     return events
+
+
+def healthy_reference(ds: Dataset, now: int | None = None) -> Calibration:
+    """The healthy reference values the detectors compare against, measured from this dataset."""
+    frames = {it["facility"]["id"]: _running_frame(ds, it, now) for it in iter_facilities(ds)}
+    return calibrate(ds, frames, now)
+
+
+def detect_all(ds: Dataset, now: int | None = None) -> list[Event]:
+    failures = detect_pump_failures(ds, now)
+    return failures + detect_slow_problems(ds, now, failures)
+
+
+# ---------------------------------------------------------------- helpers
+
+def _runs(mask: np.ndarray):
+    padded = np.concatenate(([False], mask, [False])).astype(np.int8)
+    d = np.diff(padded)
+    return zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1) - 1)
+
+
+def _hhmm(ts: int) -> str:
+    return pd.Timestamp(ts, unit="s").strftime("%a %H:%M")

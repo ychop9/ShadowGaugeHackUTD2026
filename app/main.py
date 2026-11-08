@@ -1,124 +1,141 @@
-# Import os module for directory and file path manipulations
-import os
-# Import glob module to search for files matching patterns
-import glob
-# Import FastAPI framework classes and HTTP exceptions
-from fastapi import FastAPI, HTTPException, status, Depends
-# Import CORS middleware for frontend connection support
+"""HTTP API for the ShadowGauge console. Thin layer over `engine/`.
+
+Run from the repo root:  uvicorn app.main:app --reload --port 8000
+Any folder under data/ or test/ that holds network.json, ops.json and telemetry.csv is a dataset,
+so the judging `test/` folder shows up with no code change.
+"""
+from __future__ import annotations
+
+from functools import lru_cache
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException, Query, status
 from fastapi.middleware.cors import CORSMiddleware
-# Import data loading and analytics functions from local module
-from app.analytics import load_system_state, analyze_system_status
-# Import optimizer logic from local optimizer module
-from app.optimizer import find_lowest_cost_reroute
-# Import authentication functions and user database from auth module
-from app.auth import LoginRequest, verify_password, create_access_token, USERS_DB
 
-# Function to search for network and telemetry files automatically
-def find_dataset_files():
-    # Search for any network.json file inside data directory subfolders
-    network_files = glob.glob(os.path.join("data", "**", "network.json"), recursive=True)
-    # Search for any telemetry.csv file inside data directory subfolders
-    telemetry_files = glob.glob(os.path.join("data", "**", "telemetry.csv"), recursive=True)
-    
-    # Check if network file was found
-    if not network_files:
-        # Raise error if no network.json exists anywhere in data folder
-        raise FileNotFoundError("Could not locate network.json anywhere inside data directory.")
-    # Check if telemetry file was found
-    if not telemetry_files:
-        # Raise error if no telemetry.csv exists anywhere in data folder
-        raise FileNotFoundError("Could not locate telemetry.csv anywhere inside data directory.")
-        
-    # Return first matching network path and first matching telemetry path
-    return network_files[0], telemetry_files[0]
+from app.auth import USERS_DB, LoginRequest, create_access_token, verify_password
+from engine.dashboard import dashboard
+from engine.events import analyze
+from engine.loader import REQUIRED_FILES, Dataset, last_ts, load_dataset, series
 
-# Initialize FastAPI application instance
-app = FastAPI(title="EOG Avon Oilfield Operator API")
+ROOT = Path(__file__).resolve().parent.parent
+SEARCH_DIRS = [ROOT / "data", ROOT / "test"]
+CACHE_DIR = ROOT / "cache"
 
-# Add CORS middleware configuration
-app.add_middleware(
-    CORSMiddleware,
-    # Allow request connections from any origin
-    allow_origins=["*"],
-    # Allow authorization credentials
-    allow_credentials=True,
-    # Allow all HTTP request methods
-    allow_methods=["*"],
-    # Allow all request headers
-    allow_headers=["*"],
-)
+app = FastAPI(title="ShadowGauge API")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# Find active dataset file paths dynamically
-NETWORK_PATH, TELEMETRY_PATH = find_dataset_files()
 
-# Load initial system state objects on startup
-TANKS_DATA, PUMPS_DATA, PIPELINES_DATA = load_system_state(NETWORK_PATH, TELEMETRY_PATH)
+# ---------------------------------------------------------------- datasets
 
-# Root endpoint for server status verification
+def discover() -> dict[str, Path]:
+    found = {}
+    for base in SEARCH_DIRS:
+        if not base.is_dir():
+            continue
+        for net in sorted(base.rglob("network.json")):
+            folder = net.parent
+            if all((folder / f).is_file() for f in REQUIRED_FILES):
+                found[folder.name] = folder
+    return found
+
+
+@lru_cache(maxsize=8)
+def _load(path: str, mtime_ns: int) -> Dataset:
+    return load_dataset(path, cache_dir=CACHE_DIR)
+
+
+def get_dataset(name: str) -> Dataset:
+    folder = discover().get(name)
+    if folder is None:
+        raise HTTPException(404, f"No dataset named {name!r}")
+    return _load(str(folder), (folder / "telemetry.csv").stat().st_mtime_ns)
+
+
+@lru_cache(maxsize=64)
+def _analysis(name: str, now: int, mtime_ns: int) -> dict:
+    return analyze(get_dataset(name), now)
+
+
+def _clamp_now(ds: Dataset, now: int | None) -> int:
+    first = int(ds.telemetry.index.get_level_values("ts_unix").min())
+    end = last_ts(ds)
+    return end if now is None else max(first, min(end, now))
+
+
+# ---------------------------------------------------------------- routes
+
 @app.get("/")
-def read_root():
-    # Return simple status response
-    return {"status": "online", "system": "EOG Operations Backend"}
+def health():
+    return {"status": "online", "datasets": list(discover())}
 
-# Login API endpoint for user authentication
+
 @app.post("/api/v1/auth/login")
 def login(credentials: LoginRequest):
-    # Fetch user account record from database using username
     user = USERS_DB.get(credentials.username)
-    # Check if user exists and if entered password matches hash
     if not user or not verify_password(credentials.password, user["hashed_password"]):
-        # Raise 401 unauthorized exception for invalid credentials
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
-    # Create access token carrying username subject claim
-    access_token = create_access_token(data={"sub": user["username"]})
-    # Return bearer token payload and user profile details to frontend
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Incorrect username or password",
+                            headers={"WWW-Authenticate": "Bearer"})
     return {
-        "access_token": access_token,
+        "access_token": create_access_token({"sub": user["username"]}),
         "token_type": "bearer",
-        "user": {
-            "username": user["username"],
-            "full_name": user["full_name"],
-            "role": user["role"]
-        }
+        "user": {k: user[k] for k in ("username", "full_name", "role")},
     }
 
-# Endpoint returning active system alerts and warnings
-@app.get("/api/v1/system/status")
-def get_system_status():
-    # Fetch current file locations dynamically
-    net_p, tel_p = find_dataset_files()
-    # Load updated state from dataset files
-    tanks, pumps, _ = load_system_state(net_p, tel_p)
-    # Perform status and alert calculations
-    result = analyze_system_status(tanks, pumps)
-    # Return computed alerts payload
-    return result
 
-# Endpoint returning tank overflow time predictions
-@app.get("/api/v1/system/predictions")
-def get_predictions():
-    # Fetch current file locations dynamically
-    net_p, tel_p = find_dataset_files()
-    # Load updated state from dataset files
-    tanks, pumps, _ = load_system_state(net_p, tel_p)
-    # Perform analysis calculations
-    result = analyze_system_status(tanks, pumps)
-    # Return predictions list payload
-    return {"predictions": result["time_predictions"]}
+@app.get("/api/v1/datasets")
+def list_datasets():
+    """Every loadable dataset folder. Telemetry isn't parsed here, so this stays fast."""
+    return [{"name": n, "path": str(p.relative_to(ROOT)),
+             "has_answer_key": (p / "answer_key.json").is_file()}
+            for n, p in discover().items()]
 
-# Endpoint returning lowest cost pipeline rerouting action
-@app.post("/api/v1/optimize/reroute")
-def optimize_reroute(source_tank_id: str, volume_bbl: float):
-    # Fetch current file locations dynamically
-    net_p, tel_p = find_dataset_files()
-    # Load updated graph state from dataset files
-    tanks, _, pipelines = load_system_state(net_p, tel_p)
-    # Run optimization routing calculation
-    recommendation = find_lowest_cost_reroute(source_tank_id, volume_bbl, tanks, pipelines)
-    # Return optimal path response payload
-    return recommendation
+
+@app.get("/api/v1/datasets/{name}/network")
+def network(name: str):
+    """network.json + ops.json + the telemetry time range, for the map and the time slider."""
+    ds = get_dataset(name)
+    ts = ds.telemetry.index.get_level_values("ts_unix")
+    return {"network": ds.network, "ops": ds.ops,
+            "time_range": {"start_unix": int(ts.min()), "end_unix": int(ts.max())}}
+
+
+@app.get("/api/v1/datasets/{name}/analysis")
+def analysis(name: str, now: int | None = Query(None, description="ts_unix; default = last sample")):
+    """Alerts (ongoing, in alerts-view order) and every event, with countdowns and plans.
+    Pass `now` to time-travel: everything is computed only from readings up to then."""
+    ds = get_dataset(name)
+    folder = discover()[name]
+    return _analysis(name, _clamp_now(ds, now), (folder / "telemetry.csv").stat().st_mtime_ns)
+
+
+@lru_cache(maxsize=64)
+def _dashboard(name: str, now: int, mtime_ns: int) -> dict:
+    return dashboard(get_dataset(name), now)
+
+
+@app.get("/api/v1/datasets/{name}/dashboard")
+def get_dashboard(name: str, now: int | None = Query(None, description="ts_unix; default = last sample")):
+    """Everything the main page needs: every facility's live readings (named as in the data
+    files), detected issues with plans, trucks per system, and the alerts list.
+    Pass an increasing `now` to replay the week."""
+    ds = get_dataset(name)
+    folder = discover()[name]
+    return _dashboard(name, _clamp_now(ds, now), (folder / "telemetry.csv").stat().st_mtime_ns)
+
+
+@app.get("/api/v1/datasets/{name}/series")
+def get_series(name: str, asset_id: str, metric: str,
+               start: int | None = None, end: int | None = None,
+               max_points: int = Query(2000, ge=10, le=20000)):
+    """One sensor over time as [[ts_unix, value], ...], evenly thinned to max_points."""
+    ds = get_dataset(name)
+    try:
+        s = series(ds, asset_id, metric, end)
+    except KeyError:
+        raise HTTPException(404, f"No series {asset_id}/{metric}")
+    if start is not None:
+        s = s[s.index >= start]
+    step = max(1, len(s) // max_points)
+    s = s.iloc[::step]
+    return {"asset_id": asset_id, "metric": metric,
+            "points": [[int(t), float(v)] for t, v in s.items()]}
