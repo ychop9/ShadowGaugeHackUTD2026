@@ -223,3 +223,5 @@ color-scheme:dark;position:relative;min-height:100vh;background:#0c0518;color:va
 .sg .whyd .mu2:first-of-type,.sg .whyd .whyi:first-of-type{margin-top:12px}
 .sg .whyd .more .hd,.sg .whyd[open] .more .sh{display:none}
 .sg .whyd[open] .more .hd{display:inline}
+/* pop-ups taller than the window start at the top and scroll, instead of being cut off */
+.sg .ov>.pop{margin:auto}

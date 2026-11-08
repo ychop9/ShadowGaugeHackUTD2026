@@ -391,8 +391,7 @@ function OperatorGuide({ snap, onClose }) {
     <div className="ov" onClick={e => e.target === e.currentTarget && onClose()}>
       <div className="pop how" role="dialog" aria-modal="true" aria-label="Operator guide">
         <button className="x" onClick={onClose} aria-label="Close">✕</button>
-        <div className="mu" style={{ color: "var(--cy)" }}>OPERATOR GUIDE</div>
-        <h2>Reading this screen and what to do</h2>
+        <h2>Operator guide</h2>
         <p className="lead">Every well brings up water along with oil and gas. The water collects in a tank, and a pump sends it down a pipeline to a disposal well. If a tank reaches its shutdown level ({t0.shutdown_pct ?? "—"}%), the wells feeding it shut off automatically and oil stops flowing. This screen warns you early and tells you the cheapest way to keep wells producing.</p>
         <ol className="steps">
           <li><b>The drawing</b>
