@@ -41,7 +41,7 @@ export default function LoginPage() {
       localStorage.setItem("user", JSON.stringify(data.user));
 
       // Redirect operator to the main dashboard
-      router.push("/");
+      router.push("/shadowgauge");
     } catch (err: any) {
       setError(err.message || "Failed to connect to authentication server");
     } finally {

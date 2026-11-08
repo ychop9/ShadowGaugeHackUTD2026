@@ -5,45 +5,97 @@ import "./ShadowGauge.css";
 import SAMPLE from "./sample.js";
 
 /* ====================================================================
-   BACKEND CONTRACT  (change the two URLs / the adapt() function if yours differ)
-   GET  /api/datasets                   -> ["full_week","mock_test","test", ...]
-   GET  /api/snapshot?dataset=<name>    -> { asOf, facilities:[...], trucks }
-   See sample.js for the exact shape. Every number on the page comes from it.
-   Open the page with ?sample=1 to test the UI without a backend.
+   BACKEND CONTRACT  (see app/main.py)
+   GET /api/v1/datasets                       -> [{ name, path, has_answer_key }, ...]
+   GET /api/v1/datasets/<name>/dashboard?now= -> { now_ts, now_unix, time_range, systems:[...],
+                                                   facilities:[...], alerts:[...], emergency_trucking, ... }
+   Field names follow the challenge data files (network.json / ops.json / telemetry.csv).
+   Every number on the page comes from that response; norm() maps it onto the drawing.
+   Open the page with ?sample=1 to test the UI without a backend (sample.js is a real response).
 ==================================================================== */
-const API = process.env.NEXT_PUBLIC_API_URL || "";
-const DATASET_FALLBACK = ["full_week", "mock_test", "test"]; // used only if /api/datasets is unreachable
-const POLL_MS = 5000;
+const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const POLL_MS = 5000;          // live mode: refresh interval
+const REPLAY_TICK_MS = 2500;   // replay mode: one step every 2.5 s ...
+const REPLAY_STEP_S = 15 * 60; // ... advancing the data clock 15 minutes
 
-/* ---------- helpers ---------- */
+/* ---------- helpers (all times shown in UTC, like the data) ---------- */
 const D = x => new Date(x);
-const hm = x => (x ? D(x).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false }) : "—");
-const asOfFmt = x => D(x).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false });
+const hm = x => (x ? D(x).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "UTC" }) : "—");
+const asOfFmt = x => D(x).toLocaleString("en-US", { weekday: "short", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", hour12: false, timeZone: "UTC" }) + " UTC";
+const plusMin = (iso, m) => new Date(D(iso).getTime() + m * 60000).toISOString();
 const minBetween = (a, b) => Math.round((D(a) - D(b)) / 60000);
 const dur = m => (m == null ? "—" : `${Math.floor(Math.max(0, m) / 60)}h ${String(Math.max(0, m) % 60).padStart(2, "0")}m`);
 const money = n => (n == null ? "—" : "$" + Math.round(n).toLocaleString());
 const num = n => (n == null ? "—" : Math.round(n).toLocaleString());
 
-const COLORS = { ok: "#43e0f0", worn: "#f2b24c", failed: "#ff4f93", leak: "#ff4f93" };
+const COLORS = { ok: "#43e0f0", idle: "#7d8fb0", worn: "#f2b24c", failed: "#ff4f93", leak: "#ff4f93" };
 const TITLES = { pump_failure: "Complete pump failure", pump_wear: "Pump wear", leak: "Pipeline leak" };
-const RANK = { pump_failure: 0, leak: 1, pump_wear: 2 };
+// Backend categories (docs/SPEC.md) -> the page's issue types.
+const CATEGORY = { pump_failure: "pump_failure", pipeline_leak: "leak", pump_degradation: "pump_wear" };
 
-const pumpStatus = s => ({ running: "ok", ok: "ok", normal: "ok", degraded: "worn", worn: "worn", failed: "failed" }[String(s).toLowerCase()] ?? "ok");
-const issueType = s => {
-  const t = String(s || "").toLowerCase();
-  return t.includes("fail") ? "pump_failure" : t.includes("leak") ? "leak" : t.includes("wear") || t.includes("degrad") || t.includes("worn") ? "pump_wear" : null;
-};
+/* Turn one backend facility into what the drawing needs. `order` = its place in the
+   backend's alerts list (already sorted: soonest shutdown first, then leaks / worn pumps). */
+function norm(f, order, nowTs) {
+  const ev = f.issues?.[0] || null;                 // most urgent open issue at this facility
+  const type = ev ? CATEGORY[ev.category] ?? null : null;
+  const p = f.pump || {}, pl = f.pipeline || {}, t = f.tank || {};
+  // Pump status code 0 is normal on/off cycling (SPEC), not a fault: show it as "idle".
+  const pumpStatus = p.health === "failed" ? "failed" : p.health === "degraded" ? "worn"
+    : p.state === "stopped" ? "idle" : "ok";
+  const htl = ev?.hours_to_limit?.p50;
+  return {
+    ...f,
+    name: f.id,
+    order,
+    wellsProducing: (f.wells || []).filter(w => w.status === 1).length,
+    wellsTotal: (f.wells || []).length,
+    tankCapacityBbl: t.capacity_bbl,
+    tank: { id: t.id, levelPct: t.level_pct, shutdownPct: t.shutdown_pct, warningPct: t.warning_pct, inflowBpd: f.inflow_bpd },
+    pump: { id: p.id, status: pumpStatus, flowBpd: p.flow_bpd, normalFlowBpd: p.max_flow_bpd,
+            dischargePsi: p.discharge_psi, startLevelPct: p.start_level_pct },
+    pipe: { id: pl.id, status: pl.health === "leak" ? "leak" : "ok", pressurePsi: pl.pressure_psi,
+            normalPressurePsi: pl.normal_running_pressure_psi, receiveFlowBpd: pl.receive_flow_bpd,
+            expectedReceiveBpd: p.flow_bpd },        // conservation: what the pump sends should arrive
+    type,
+    startedAt: ev?.onset_ts ?? null,
+    event: ev,
+    otherIssues: (f.issues || []).slice(1),
+    issue: ev ? {
+      shutdownAt: htl != null ? plusMin(nowTs, htl * 60) : null,
+      repairEta: ev.repair_remaining_h != null ? plusMin(nowTs, ev.repair_remaining_h * 60) : null,
+      doNothingCost: ev.do_nothing?.cost ?? null,
+      lostRevenuePerHour: ev.lost_revenue_per_hour ?? null,
+    } : {},
+  };
+}
 
-/* turn one raw facility into what the UI needs */
-function norm(f) {
-  const pump = { ...f.pump, status: pumpStatus(f.pump?.status) };
-  const pipe = { ...f.pipeline, status: /leak/i.test(f.pipeline?.status || "") ? "leak" : "ok" };
-  const type = issueType(f.issue?.type) ?? (pump.status === "failed" ? "pump_failure" : pipe.status === "leak" ? "leak" : pump.status === "worn" ? "pump_wear" : null);
-  if (type === "pump_failure") pump.status = "failed";
-  if (type === "pump_wear" && pump.status === "ok") pump.status = "worn";
-  if (type === "leak") pipe.status = "leak";
-  const startedAt = f.issue?.startedAt ?? (type === "leak" ? pipe.since : pump.since);
-  return { ...f, tank: f.tank || {}, pump, pipe, type, startedAt, issue: f.issue || {} };
+/* Plain-English steps for the "Do this now" box, from the backend's recommended_actions. */
+function planText(fac, asOf, truckCapBbl) {
+  const ev = fac.event;
+  if (!ev) return null;
+  const steps = [];
+  for (const a of ev.recommended_actions || []) {
+    if (a.type === "dispatch_truck") {
+      const times = (ev.truck_arrivals_min || []).map(m => hm(plusMin(asOf, m))).join(", ");
+      const each = truckCapBbl != null ? ` Each arrival removes ${num(a.trucks * truckCapBbl)} bbl.` : "";
+      const trucks = `${a.trucks} truck${a.trucks > 1 ? "s" : ""}`;
+      const trips = `${a.trips_per_truck} trip${a.trips_per_truck > 1 ? "s" : ""}${a.trucks > 1 ? " each" : ""}`;
+      steps.push(`Send ${trucks}, ${trips}. Arriving ${times}.${each}`);
+    } else if (a.type === "shut_in_wells") {
+      const at = plusMin(asOf, a.start_after_min || 0);
+      steps.push(`Shut in ${a.wells.join(", ")} at ${hm(at)}${a.start_after_min ? ` (in ${a.start_after_min} min)` : " now"}, until the pump is repaired.`);
+    } else if (a.type === "field_inspection") {
+      steps.push(`Send an inspector to ${a.asset_id}.`);
+    } else if (a.type === "none") {
+      steps.push(ev.do_nothing?.shutdown_after_min == null
+        ? "No action needed: the tank stays below shutdown until the repair."
+        : "Let the automatic shut-in happen: every alternative costs more.");
+    }
+  }
+  if (ev.do_nothing?.shutdown_after_min != null && ev.category === "pump_failure") {
+    steps.push(`Doing nothing: tank reaches shutdown at ${hm(plusMin(asOf, ev.do_nothing.shutdown_after_min))} and all wells stop until the repair.`);
+  }
+  return { steps, cost: ev.est_cost ?? null, nothing: ev.do_nothing?.cost ?? null };
 }
 const facColor = f => (f.type === "pump_failure" || f.type === "leak" ? COLORS.failed : f.type === "pump_wear" ? COLORS.worn : "#4fe0a0");
 
@@ -62,13 +114,21 @@ const Stream = ({ x, y, w, h, kind, speed = "" }) => (
   </svg>
 );
 
-/* how fast the pump spins for each state (1 = normal) */
-const SPIN = { pump_wear: 0.4, leak: 0.12, pump_failure: 0.08 };
+/* Pump spin speed (1 = rated flow). Follows the real flow: a stopped or failed pump doesn't
+   spin, a leaking pipeline's pump still runs at full speed, and a worn pump's 5-15 % loss is
+   exaggerated 4x so it's visible (the label shows the true %). */
+function spinFor(pump) {
+  if (!pump || !pump.normalFlowBpd || !(pump.flowBpd > 0)) return 0;
+  const r = pump.flowBpd / pump.normalFlowBpd;
+  return pump.status === "worn" ? Math.max(0.25, 1 - 4 * (1 - r)) : Math.min(1.1, r);
+}
 
 export default function ShadowGauge() {
-  const [datasets, setDatasets] = useState(DATASET_FALLBACK);
-  const [dataset, setDataset] = useState(DATASET_FALLBACK[0]);
+  const [datasets, setDatasets] = useState([]);
+  const [dataset, setDataset] = useState(null);
   const [snap, setSnap] = useState(null);
+  const [replayNow, setReplayNow] = useState(null);   // null = live (latest reading)
+  const [playing, setPlaying] = useState(false);
   const [error, setError] = useState(null);
   const [selId, setSelId] = useState(null);
   const [open, setOpen] = useState(false);
@@ -79,38 +139,62 @@ export default function ShadowGauge() {
   useEffect(() => { setMode(new URLSearchParams(window.location.search).has("sample") ? "sample" : "live"); }, []);
   const USE_SAMPLE = mode === "sample";
 
-  /* dataset list */
+  /* dataset list: every folder the backend found (a `test` folder appears automatically) */
   useEffect(() => {
     if (mode !== "live") return;
-    fetch(`${API}/api/datasets`).then(r => r.json()).then(j => {
-      const list = Array.isArray(j) ? j : j.datasets;
-      if (list?.length) { setDatasets(list); setDataset(d => (list.includes(d) ? d : list[0])); }
-    }).catch(() => {});
+    fetch(`${API}/api/v1/datasets`).then(r => r.json()).then(j => {
+      const list = (Array.isArray(j) ? j : []).map(d => d.name);
+      setDatasets(list);
+      setDataset(d => (list.includes(d) ? d : list.includes("test") ? "test" : list[0] ?? null));
+      if (!list.length) setError("the backend found no dataset folders");
+    }).catch(e => setError(e.message || "failed"));
   }, [mode]);
 
-  /* snapshot polling */
+  /* switching dataset goes back to live */
+  const changeDataset = d => { setPlaying(false); setReplayNow(null); setDataset(d); };
+
+  /* load the dashboard: live = poll the latest reading; replay = load each new `now` */
   useEffect(() => {
     if (!mode) return;
     if (USE_SAMPLE) { setSnap(SAMPLE); return; }
+    if (!dataset) return;
     let stop = false;
-    setSnap(null); setError(null);
+    if (replayNow == null) { setSnap(null); }
+    setError(null);
     const load = async () => {
       try {
-        const r = await fetch(`${API}/api/snapshot?dataset=${encodeURIComponent(dataset)}`);
+        const q = replayNow != null ? `?now=${replayNow}` : "";
+        const r = await fetch(`${API}/api/v1/datasets/${encodeURIComponent(dataset)}/dashboard${q}`);
         if (!r.ok) throw new Error(`HTTP ${r.status}`);
         const j = await r.json();
         if (!stop) { setSnap(j); setError(null); }
       } catch (e) { if (!stop) setError(e.message || "failed"); }
     };
     load();
+    if (replayNow != null) return () => { stop = true; };
     const t = setInterval(load, POLL_MS);
     return () => { stop = true; clearInterval(t); };
-  }, [dataset, mode]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [dataset, mode, replayNow]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const facs = useMemo(() => (snap?.facilities || []).map(norm), [snap]);
-  const issues = useMemo(() => facs.filter(f => f.type).sort((a, b) =>
-    RANK[a.type] - RANK[b.type] ||
-    (a.type === "pump_failure" ? D(a.issue.shutdownAt || 9e15) - D(b.issue.shutdownAt || 9e15) : 0)), [facs]);
+  /* replay clock: step the data forward while playing; stop at the end of the data */
+  useEffect(() => {
+    if (!playing || !snap?.time_range) return;
+    const t = setTimeout(() => {
+      const next = (replayNow ?? snap.time_range.start_unix) + REPLAY_STEP_S;
+      if (next >= snap.time_range.end_unix) { setPlaying(false); setReplayNow(null); }
+      else setReplayNow(next);
+    }, REPLAY_TICK_MS);
+    return () => clearTimeout(t);
+  }, [playing, snap]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const facs = useMemo(() => {
+    if (!snap) return [];
+    const order = new Map();
+    (snap.alerts || []).forEach((a, i) => { if (!order.has(a.facility_id)) order.set(a.facility_id, i); });
+    return (snap.facilities || []).map(f => norm(f, order.get(f.id) ?? Infinity, snap.now_ts));
+  }, [snap]);
+  /* backend already ranks alerts (SPEC alerts view); keep its order */
+  const issues = useMemo(() => facs.filter(f => f.type).sort((a, b) => a.order - b.order), [facs]);
   const fac = facs.find(f => f.id === selId) || issues[0] || facs[0];
   useEffect(() => { if (facs.length && !facs.some(f => f.id === selId)) setSelId((issues[0] || facs[0]).id); }, [facs]); // eslint-disable-line
 
@@ -139,7 +223,7 @@ export default function ShadowGauge() {
   /* pump rotation: speed = real flow / normal flow, eases down on failure */
   const rotor = useRef(null);
   const ratio = useRef(0);
-  ratio.current = fac ? (SPIN[fac.type] ?? 1) : 0;
+  ratio.current = fac ? spinFor(fac.pump) : 0;
   useEffect(() => {
     let raf, last = performance.now(), ang = 0, cur = ratio.current;
     const tick = t => {
@@ -160,9 +244,22 @@ export default function ShadowGauge() {
       <div className="logo"><i />SHADOWGAUGE</div>
       <div className="tab">Operations</div>
       <div className="hr">
-        {snap && <span className="asof">As of {asOfFmt(snap.asOf)}</span>}
+        {snap && <span className="asof">{replayNow != null ? "Replay · " : "As of "}{asOfFmt(snap.now_ts)}</span>}
+        {snap?.time_range && !USE_SAMPLE && (
+          <div className="replay">
+            <button type="button" onClick={() => setPlaying(p => !p)} aria-label={playing ? "Pause replay" : "Play replay"}>
+              {playing ? "❚❚" : "▶"}
+            </button>
+            <input type="range" aria-label="Replay time"
+              min={snap.time_range.start_unix} max={snap.time_range.end_unix} step={300}
+              value={replayNow ?? snap.time_range.end_unix}
+              onChange={e => { setPlaying(false); const v = Number(e.target.value); setReplayNow(v >= snap.time_range.end_unix ? null : v); }} />
+            <button type="button" onClick={() => { setPlaying(false); setReplayNow(null); }} disabled={replayNow == null}>Latest</button>
+          </div>
+        )}
         <label className="dsel">Dataset
-          <select value={dataset} onChange={e => setDataset(e.target.value)} disabled={USE_SAMPLE}>
+          <select value={dataset ?? ""} onChange={e => changeDataset(e.target.value)} disabled={USE_SAMPLE || !datasets.length}>
+            {USE_SAMPLE && <option value="">sample</option>}
             {datasets.map(d => <option key={d} value={d}>{d}</option>)}
           </select>
         </label>
@@ -176,8 +273,8 @@ export default function ShadowGauge() {
       <div className="sg">{bg}{header}
         <main><section className="card box" style={{ gridColumn: "1/-1" }}>
           {error
-            ? <><b>Can’t reach the backend.</b><div className="mu" style={{ marginTop: 6 }}>Tried {API || "this site"}/api/snapshot?dataset={dataset} ({error}). Start your API, or add ?sample=1 to the page address to preview the layout.</div></>
-            : <div className="mu">Loading {dataset}…</div>}
+            ? <><b>Can’t reach the backend.</b><div className="mu" style={{ marginTop: 6 }}>Tried {API}/api/v1/datasets{dataset ? `/${dataset}/dashboard` : ""} ({error}). Start the API (uvicorn app.main:app --port 8000), or add ?sample=1 to the page address to preview the layout.</div></>
+            : <div className="mu">Loading {dataset ?? "datasets"}…</div>}
         </section></main>
       </div>
     );
@@ -185,32 +282,38 @@ export default function ShadowGauge() {
 
   /* ---------- derived values for the selected facility ---------- */
   const { tank, pump, pipe, type } = fac;
-  const asOf = snap.asOf;
+  const asOf = snap.now_ts;
   const color = type ? facColor(fac) : COLORS.ok;
   const pct = Math.max(0, Math.min(100, tank.levelPct ?? 0));
   const waterTop = 300 - 1.7 * pct;
   const limitY = tank.shutdownPct != null ? 300 - 1.7 * tank.shutdownPct : null;
   const cap = fac.tankCapacityBbl;
-  const flowing = pump.status !== "failed";
-  const slow = pump.status === "worn";
+  const flowing = pump.flowBpd > 0;               // a healthy pump is off about half the time
   const leak = pipe.status === "leak";
-  const flowSpeed = type === "pump_failure" ? "crawl dim" : type === "leak" ? "slower" : type === "pump_wear" ? "slow" : "";
-  const inKind = type === "pump_failure" ? "leak" : type === "pump_wear" ? "worn" : "ok";
-  const outKind = type === "pump_failure" || type === "leak" ? "leak" : type === "pump_wear" ? "worn" : "ok";
+  const flowSpeed = !flowing ? "crawl dim" : pump.status === "worn" ? "slow" : "";
+  const inKind = type === "pump_failure" ? "leak" : pump.status === "worn" ? "worn" : "ok";
+  const outKind = leak ? "leak" : pump.status === "worn" ? "worn" : "ok";
   const pipeFill = leak ? "url(#sg-pipeL)" : flowing ? "url(#sg-pipe)" : "url(#sg-pipeD)";
   const elapsed = fac.startedAt ? minBetween(asOf, fac.startedAt) : null;
   const toShutdown = fac.issue.shutdownAt ? minBetween(fac.issue.shutdownAt, asOf) : null;
-  const plan = type ? planText(fac, asOf) : null;
+  const plan = type ? planText(fac, asOf, snap.emergency_trucking?.truck_capacity_bbl) : null;
   const saved = plan?.cost != null && plan?.nothing != null ? plan.nothing - plan.cost : null;
-  const pumpPct = pump.normalFlowBpd ? Math.round((pump.flowBpd / pump.normalFlowBpd) * 100) : null;
+  const pumpPct = pump.normalFlowBpd && pump.flowBpd > 0 ? Math.round((pump.flowBpd / pump.normalFlowBpd) * 100) : null;
   const pill = !type ? ["ok", "● ALL NORMAL"] : type === "pump_failure" ? ["crit", "● TRANSFER INTERRUPTED"] : type === "leak" ? ["crit", "● PIPELINE LEAK"] : ["warn", "● PUMP WORN"];
-  const pumpLine = pump.status === "failed" ? `FAILED · FLOW ${num(pump.flowBpd ?? 0)} BPD`
-    : pump.status === "worn" ? `WORN · ${pumpPct ?? "—"}% OF NORMAL FLOW`
+  const pumpLine = pump.status === "failed" ? `FAULT · FLOW ${num(pump.flowBpd ?? 0)} BPD`
+    : pump.status === "idle" ? `STANDBY · STARTS AT ${pump.startLevelPct ?? "—"}% TANK`
+    : pump.status === "worn" ? (pumpPct != null ? `WORN · ${pumpPct}% OF RATED FLOW` : "WORN · STANDBY")
     : `RUNNING · ${num(pump.flowBpd)} BPD · ${num(pump.dischargePsi)} PSI`;
   const dotPos = type === "leak" ? [790, 252] : [516, 213];
   const n = facs.length;
-  const pos = (f, i) => (f.x != null && f.y != null ? [f.x, f.y]
-    : [50 + 34 * Math.cos((i / n) * 2 * Math.PI - Math.PI / 2), 50 + 34 * Math.sin((i / n) * 2 * Math.PI - Math.PI / 2)]);
+  const system = (snap.systems || []).find(s => s.id === fac.system_id);
+  // Network map: real lat/lon, scaled to the box with a margin.
+  const pts = [...facs.map(f => [f.lon, f.lat]), ...(snap.systems || []).map(s => [s.disposal_site?.lon, s.disposal_site?.lat])]
+    .filter(([x, y]) => x != null && y != null);
+  const [x0, x1] = [Math.min(...pts.map(p => p[0])), Math.max(...pts.map(p => p[0]))];
+  const [y0, y1] = [Math.min(...pts.map(p => p[1])), Math.max(...pts.map(p => p[1]))];
+  const toMap = (lon, lat) => [8 + 84 * (x1 > x0 ? (lon - x0) / (x1 - x0) : 0.5), 8 + 84 * (y1 > y0 ? (y1 - lat) / (y1 - y0) : 0.5)];
+  const short = id => id.replace(/_FACILITY_/, "-");
   const select = id => { setSelId(id); };
   const openIssue = id => { setSelId(id); setOpen(true); };
 
@@ -237,7 +340,7 @@ export default function ShadowGauge() {
               <select className="fsel" value={fac.id} onChange={e => select(e.target.value)} aria-label="Facility">
                 {[...issues, ...facs.filter(f => !f.type)].map(f => <option key={f.id} value={f.id}>{f.type ? "● " : ""}{f.name}</option>)}
               </select>
-              <small>{[fac.wells != null && `${fac.wells} producing wells`, cap != null && `${num(cap)} bbl capacity`].filter(Boolean).join(" · ")}</small>
+              <small>{[`System ${fac.system_id}`, `${fac.wellsProducing} of ${fac.wellsTotal} wells producing`, cap != null && `${num(cap)} bbl tank`].filter(Boolean).join(" · ")}</small>
             </div>
             <div className={`pill ${pill[0]}`}>{pill[1]}</div>
           </div>
@@ -286,7 +389,7 @@ export default function ShadowGauge() {
               <rect x="20" y="86" width="120" height="16" rx="4" fill="url(#sg-pipe)" />
               <rect x="132" y="86" width="16" height="38" fill="url(#sg-pipe)" />
               <Stream x={28} y={89} w={112} h={10} kind="ok" />
-              <text className="lbl" x="20" y="70">FROM {fac.wells != null ? fac.wells + " " : ""}WELLS</text>
+              <text className="lbl" x="20" y="70">FROM {fac.wellsProducing} WELLS · {num(tank.inflowBpd)} BPD</text>
 
               <ellipse cx="170" cy="322" rx="104" ry="14" fill="#06101c" />
               <path d="M76 130 V300 A94 20 0 0 0 264 300 V130Z" fill="url(#sg-steel)" />
@@ -370,21 +473,24 @@ export default function ShadowGauge() {
           <div className="card box">
             <h3>Network <span>{n} FACILITIES</span></h3>
             <div className="map">
-              <div className="node" style={{ left: "50%", top: "50%", "--c": "var(--cy)" }}><i style={{ width: 22, height: 22 }} />SWD</div>
-              {facs.map((f, i) => { const [x, y] = pos(f, i); return (
-                <div key={f.id} className={`node click ${f.id === fac.id ? "cur" : ""}`} style={{ left: `${x}%`, top: `${y}%`, "--c": facColor(f) }} onClick={() => select(f.id)}>
-                  <i />{f.name.toUpperCase()}
+              {(snap.systems || []).filter(s => s.disposal_site?.lat != null).map(s => { const [x, y] = toMap(s.disposal_site.lon, s.disposal_site.lat); return (
+                <div key={s.id} className="node swd" style={{ left: `${x}%`, top: `${y}%`, "--c": "var(--cy)" }} title={s.disposal_site.id}>
+                  <i />{s.id} SWD
+                </div>); })}
+              {facs.map(f => { const [x, y] = toMap(f.lon, f.lat); return (
+                <div key={f.id} className={`node click ${f.id === fac.id ? "cur" : ""}`} style={{ left: `${x}%`, top: `${y}%`, "--c": facColor(f) }} onClick={() => select(f.id)} title={f.id}>
+                  <i />{short(f.id)}
                 </div>); })}
             </div>
-            <div className="legend"><span><i style={{ background: "var(--gr)" }} />OK</span><span><i style={{ background: "var(--am)" }} />Worn</span><span><i style={{ background: "var(--pk)" }} />Failed / leak</span></div>
+            <div className="legend"><span><i style={{ background: "var(--gr)" }} />OK</span><span><i style={{ background: "var(--am)" }} />Worn</span><span><i style={{ background: "var(--pk)" }} />Failed / leak</span><span><i style={{ background: "var(--cy)" }} />Disposal</span></div>
           </div>
 
-          {snap.trucks && (
+          {system && (
             <div className="card trk">🚚<div>
-              <b>{snap.trucks.total} shared trucks · {snap.trucks.slots} load slots</b>
-              <small>{snap.trucks.assignments?.length
-                ? snap.trucks.assignments.map(a => `${a.slots} for ${facs.find(f => f.id === a.facilityId)?.name || a.facilityId}`).join(" · ")
-                : "No trucks needed right now"}</small>
+              <b>System {system.id}: {system.emergency_fleet_size} truck{system.emergency_fleet_size === 1 ? "" : "s"} · {system.trucks_free} free</b>
+              <small>{system.trucks_assigned?.length
+                ? system.trucks_assigned.map(a => `${a.trucks} × ${a.trips_per_truck} trip${a.trips_per_truck > 1 ? "s" : ""} → ${short(a.facility_id)}`).join(" · ")
+                : "No trucks needed in this system right now"}</small>
             </div></div>
           )}
         </aside>

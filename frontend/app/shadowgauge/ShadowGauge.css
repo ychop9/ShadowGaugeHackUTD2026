@@ -96,3 +96,11 @@ color-scheme:dark;position:relative;min-height:100vh;background:#07030c;color:va
 .sg .stream.slower{animation-duration:3.8s}
 .sg .stream.crawl{animation-duration:9s}
 .sg .stream.dim{opacity:.5}
+
+/* replay controls + disposal nodes */
+.sg .replay{display:flex;align-items:center;gap:8px}
+.sg .replay button{background:#150a2a;color:var(--tx);border:1px solid var(--line);border-radius:8px;padding:5px 10px;font-size:12px;cursor:pointer}
+.sg .replay button:disabled{opacity:.4;cursor:default}
+.sg .replay input[type=range]{width:180px;accent-color:var(--cy)}
+.sg .node.swd i{width:9px;height:9px;border-radius:2px;box-shadow:0 0 10px var(--c)}
+@media(max-width:1000px){.sg header{flex-wrap:wrap;gap:12px}.sg .hr{margin-left:0;flex-wrap:wrap}}
